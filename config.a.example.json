@@ -1,0 +1,23 @@
+{
+  "role": "a",
+  "control_token": "GENERATED_BY_PYTHON_MINUS_M_MYTRN_INIT_A",
+  "data_psk": "GENERATED_BY_PYTHON_MINUS_M_MYTRN_INIT_A",
+  "admin_token": "GENERATED_BY_PYTHON_MINUS_M_MYTRN_INIT_A",
+  "web_bind": "127.0.0.1",
+  "web_port": 18881,
+  "state_dir": "state.a",
+  "local_udp_bind": "0.0.0.0",
+  "local_udp_port": 39999,
+  "stun_servers": ["stun.cloudflare.com:3478"],
+  "stun_check_interval": 30,
+  "stun_keepalive_interval": 15,
+  "endpoint_change_confirm": 2,
+  "register_refresh_interval": 1800,
+  "control_retry_interval": 15,
+  "control_socks5": "socks5://127.0.0.1:10810",
+  "control_host": "B_CONTROL_HOST",
+  "control_port": 18080,
+  "targets": {
+    "demo": {"host": "127.0.0.1", "port": 8080}
+  }
+}

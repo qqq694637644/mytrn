@@ -1,0 +1,18 @@
+{
+  "role": "b",
+  "control_token": "COPY_THE_ACTUAL_CONTROL_TOKEN_FROM_A",
+  "data_psk": "COPY_THE_ACTUAL_DATA_PSK_FROM_A",
+  "admin_token": "GENERATED_BY_PYTHON_MINUS_M_MYTRN_INIT_B",
+  "web_bind": "127.0.0.1",
+  "web_port": 18882,
+  "state_dir": "state.b",
+  "control_bind": "127.0.0.1",
+  "control_port": 18080,
+  "warp_socks5": "socks5://127.0.0.1:40000",
+  "ping_interval": 5,
+  "reconnect_interval": 5,
+  "max_failures": 3,
+  "forwards": [
+    {"id": "demo", "listen_host": "127.0.0.1", "listen_port": 18081}
+  ]
+}
