@@ -7,7 +7,7 @@
 - A：Windows / Python 3.13，固定 UDP 39999；与 STUN 共用同一 socket；支持两次确认 endpoint 变更、启动注册、30 分钟兜底 refresh、网络异常重试。
 - B：Linux / Python 3.10+，`socks5://127.0.0.1:40000` UDP ASSOCIATE；B **主动**向 A 建立 QUIC 会话；连接断开/代理关闭后自动重拨。
 - **真实 TCP 端口转发**：B 本机 `127.0.0.1:监听端口` → QUIC/WARP/SOCKS5 UDP → A → 白名单中配置的目标 TCP 地址和端口，支持多条 TCP 连接。
-- 安全：QUIC/TLS 加密，B 从经鉴权的控制面接收并固定（pin）A 的证书；每条转发流使用共享密钥 HMAC、时间戳和 nonce 鉴权；仅能访问 A 显式允许的端口。
+- 安全：QUIC/TLS 加密，B 从经鉴权的控制面接收并固定（pin）A 的证书。**QUIC TLS 握手后必须先用 `data_psk` 完成会话认证**，否则不会进入 `DATA_ACTIVE`；每条转发流还会使用 HMAC、时间戳和 nonce 鉴权；仅能访问 A 显式允许的端口。
 - 配置通过 A、B 各自的**本机 Web 界面**修改，保存在 `config.a.json` 和 `config.b.json`；修改后重启生效。
 - 不实现系统 TUN、不建立任何公网 HTTP/SOCKS 业务入口；B 本机监听仅是把 **B 本机的指定 TCP 流量** 交给已主动拨通的隧道。
 
@@ -109,17 +109,18 @@ curl -v http://127.0.0.1:18081/
 - A 启动后从固定 UDP socket 发 STUN；正常情况按约 15 秒维持并检测映射；连续两次发现新 endpoint 后自动通过控制面上报 B。
 - A 不做频繁 HTTP status poll。正常情况下只在启动、endpoint 变化、数据面长期静默或 30 分钟兜底刷新时上报。
 - B 保存最近登记的 A endpoint 和 TLS 证书到 `state.b/registration.json`，重启后可用旧 endpoint 立即尝试连接，不必等待控制面轮询。
-- B QUIC PING/PONG、代理断线检测和重连；A/B 进程重启、WARP SOCKS5 断线会自动重建会话。
+- B QUIC PING/PONG、代理断线检测和重连；A/B 进程重启、WARP SOCKS5 断线会自动重建会话。A endpoint 变化确认后会关闭旧 QUIC 会话，B 在收到映射更新后重新认证并连接。
 - 若 A 的证书/私钥遗失导致证书更新，B 会拒绝自动替换被固定的证书。**先通过安全带外渠道核验 A 的新证书指纹，再由管理员备份并删除 B 的 `state.b/registration.json` 以重新建立信任。**
 - 第一版 agent 为前台命令运行；暂不创建 Windows 服务或 systemd 服务。
 
 ## 现有验证与限制
 
-`python -m pytest -q` 在本机使用模拟 STUN、SOCKS5 UDP relay、真实 A/B QUIC 和 TCP echo 服务执行端到端测试；**真实的电信 NAT1 + CF/VLESS + WARP 跨境链路仍需现场验证**。
+`python -m pytest -q` 在本机使用模拟 STUN、SOCKS5 UDP relay、真实 A/B QUIC 和 TCP echo 服务执行端到端测试。额外包括连续 100 次短连接、40 次失败转发后服务恢复、协议头与大块 TCP 数据合包、错误 `data_psk` 拒绝、模拟 NAT endpoint 变化及模拟 WARP UDP relay 中断后的重新连通；**真实的电信 NAT1 + CF/VLESS + WARP 跨境链路仍需现场验证**。
 
 - 首版只支持固定**TCP** 目标端口转发，不是任意 SOCKS 代理或 UDP 端口转发，也不是全局 TUN。
 - 第一版不提供实时热更新。Web UI 保存配置后重启进程才应用。
 - 本地内测通过不能替代真实长稳、延迟、丢包、断网重连测试。
-- 目前未做显式应用层待发送队列内存限流、QoS 或多节点调度；不可据此宣称生产级长期高吞吐稳定性。
+- 当前应用层有并发 stream 上限和单 stream 待发送数据缓冲限制，但尚未完成高并发吞吐和长时间性能验证，也没有 QoS 或多节点调度；不可据此宣称生产级长期高吞吐稳定性。
+- 配置采用严格键名校验；未知键（包括历史测试开关 `allow_private_endpoint`）直接报错，不保留旧协议兼容。
 
 详见 [`PLAN.md`](PLAN.md)。

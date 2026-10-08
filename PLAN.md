@@ -1,423 +1,143 @@
-# mytrn 项目计划
+# mytrn — 单 A / 单 B UDP 隧道与指定 TCP 端口转发计划
 
-## 1. 项目目标
+> 当前唯一有效的实现计划。与已淘汰的 HTTP GET、自定义 DATA/ACK 帧、第三方 rendezvous、B 公网被动入口等旧设计不兼容，也不保留兼容层。
 
-实现一个不租第三方公网控制节点的跨境 UDP 数据通道原型。
+## 1. 目标与不可变的网络方向
 
-核心方案：
-
-```text
-控制面：A -> v2rayN SOCKS5 -> VLESS -> Cloudflare CDN -> B
-数据面：B -> WARP SOCKS5 UDP -> Cloudflare/WARP 出口 -> A 公网 NAT endpoint
-```
-
-控制面只做低频注册、endpoint 变更通知和故障恢复；数据面长期运行，负责 ping/pong、后续 payload 和存活检测。
-
-## 2. 当前已验证事实
-
-已通过实测验证：
+**B（境外 VPS）通过自己本机的 WARP SOCKS5 `UDP ASSOCIATE`，主动连接 A（境内 Windows）的 STUN 公网映射。**
 
 ```text
-CONTROL-PLANE: PASS
-STUN-FULLCONE-BOOTSTRAP: PASS / REPORTED
-WARP-SOCKS5-UDP-ASSOCIATE: PASS
-Bidirectional WARP/SOCKS5 replies: 5/5
-WARP-SOCKS5-DATA-PLANE: PASS
-OVERALL: PASS
+数据面（B 主动拨入 A）：
+B agent QUIC client
+  -> B localhost WARP SOCKS5 UDP :40000
+  -> Cloudflare/WARP UDP 出口
+  -> 电信 NAT1 公网 endpoint（由 A 同 socket STUN 得到）
+  -> A 家用光猫/路由器 UDP 39999 端口映射
+  -> A Windows agent UDP :39999（QUIC server）
+
+控制面（低频、独立于数据面）：
+A agent -> A 本机 v2rayN SOCKS5 :10810
+        -> VLESS / Cloudflare CDN
+        -> B HTTP /control/mapping :18080
 ```
 
-A 端观察到数据面来源为 Cloudflare/WARP 出口：
+不租 C 节点，不要求 B 有可直接访问的公网 UDP 或 TCP 业务入口。B 的公网 IP 可能被 GFW 封锁，但这不影响以上已分离的连接方向。
+
+历史探测已经验证 `B WARP SOCKS5 UDP -> A STUN 映射` 的双向 UDP 包 5/5 成功；这不等于 QUIC 新版已在真实跨境链路验证通过，也不代表不配置家用路由器端口映射就一定可打通。
+
+### A 侧地址与端口的区别
 
 ```text
-104.28.227.105:29876
+A 进程固定绑定：UDP 39999
+家用路由器固定转发：UDP 39999 -> A 内网 IP:39999
+电信上层 NAT1：A 经 STUN 获得公网 IP:PORT（可能不是 39999）
 ```
 
-这说明 B 端通过 `127.0.0.1:40000` WARP SOCKS5 的 UDP ASSOCIATE 发出的 UDP 包，能够命中 A 的公网 NAT endpoint，并且 A 的回复能够回到 B。
+例如此前 STUN 观察到 `119.98.144.218:55781`；它是一次历史观测值，不写死在实现中。B **仅使用最新的 STUN 公网 IP:PORT** 主动拨入 A。
 
-## 3. 网络模型
+## 2. MVP 范围（确认）
 
-### A 端：境内 NAT 节点
+- **节点**：单 A、单 B；A 固定 Windows / Python 3.13、固定内网 IP、UDP 39999；B 为 Linux VPS。
+- **真实转发**：只支持配置允许的 **TCP 目标端口**，不是只有 PING/PONG。B 本机 `127.0.0.1:listen_port` 上的 TCP 流量进入 B 已主动建立的 QUIC 隧道，由 A 连接其白名单目标（可以是 A 本机或 A 内网另一台设备）。B 本机监听是本地应用入口，**不是 B 对公网暴露业务端口**。
+- **连通与恢复**：映射变化后目标为几分钟内恢复；断网、A/B agent 重启、B SOCKS5 UDP relay 断开后自动尝试重连。
+- **部署**：前台 Python 进程，不做 Windows 服务或 systemd；用户自行维护防火墙、光猫路由器永久映射。
+- **配置**：A/B 各自通过本机 Web UI 修改 JSON 配置，保存后需重启进程。只保存本地密钥与状态；示例配置可提交，真实配置、私钥不进 Git。
+- **不做**：TCP 全局透明代理、TUN、通用 SOCKS 服务、UDP 业务端口转发、多节点、自动公网穿透配置、应用热重载、旧协议兼容。
 
-A 是内网机器，固定监听本地 UDP 端口，例如：
+## 3. 数据面实现（QUIC over WARP SOCKS5 UDP）
+
+### QUIC 会话
+
+1. B 接到经控制面登记的 A endpoint 和 A TLS 证书；使用证书固定验证 A 身份。
+2. B 经 `socks5://127.0.0.1:40000` 的 `UDP ASSOCIATE` 发送 QUIC Initial，**B 为 QUIC client，A 为 QUIC server**。
+3. QUIC/TLS 握手完成后，B 立即通过首条双向流（stream 0）发送绑定时间戳与随机 nonce 的 `data_psk` HMAC 会话证明。
+4. A 验证通过并返回 `OK`，B 才将状态转成 `DATA_ACTIVE`，允许建立业务流。认证失败直接终止会话，不提供降级、密钥回退或明文兼容。
+5. A 对未完成会话认证的 QUIC 连接设置短超时（当前 20 秒）；仅已完成应用层认证的健康会话拥有单会话保护，不允许未认证请求无限占据唯一槽位。
+
+### 指定 TCP 端口转发
 
 ```text
-A local UDP: 39999
+B 本机业务程序 -> B agent 127.0.0.1:listen_port
+-> B 已建立的 QUIC stream -> WARP SOCKS5 UDP -> A UDP :39999
+-> A 按 targets 白名单连接 target_host:target_port
+-> 双向 TCP <-> QUIC stream 数据转发
 ```
 
-家里光猫/路由器配置端口映射：
+- B 的 `forwards[].id` 必须对应 A `targets` 中同名规则；A 不接受 B 自由指定任意目标地址/端口。
+- 每个业务 stream 仍需要 `data_psk` HMAC、时间戳、nonce 验证，拒绝重放；底层 QUIC 提供 TLS 加密、重传、流量控制、拥塞控制和多路复用。
+- OPEN/OK 控制头是行分隔 JSON/文本，**只限制换行符之前的头部长度**（1024 字节），同一帧中跟随的 TCP payload 必须完整透传。
+- 处理双向 TCP 半关闭；两方向均完成后立即回收应用层 stream，不等待 QUIC session 关闭。拒绝、异常、连接超时也必须进入最终回收路径。
+- 当前限制：最多 32 条并发业务 stream、单 stream 已发送未确认数据应用层缓冲限额；半关闭长期无响应时有超时保护。具体数值以源码为准。
+
+## 4. 控制面与 endpoint 维护
+
+### A
+
+1. 使用**同一个 UDP :39999 socket** 同时收发 STUN 和 QUIC，避免另一个 STUN socket 测到无关映射。
+2. 启动时发现 endpoint，通过 v2rayN SOCKS5 → VLESS/CF 向 B 的 `POST /control/mapping` 上报 JSON（IP、端口、A 证书），HTTP 头 `X-Control-Token` 鉴权；不把 token 放入 GET URL。
+3. 周期性 STUN/keepalive（建议 15 秒），检测 IP 或公网端口变化；连续两次发现相同的新 endpoint 后才确认变化、通知 B。
+4. endpoint 变动时，A 主动结束旧 QUIC 会话以允许 B 重拨新映射。相同 endpoint 不重复触发重连。
+5. 正常连接时不高频 HTTP poll；保留 30 分钟低频登记和数据面长时间静默后的再登记，以处理 B 重启/状态丢失。
+6. 网络错误自动重试，失败原因可从状态接口/日志定位。
+
+### B
+
+1. HTTP 控制监听地址/端口可配置（默认仅本机 `127.0.0.1:18080`，与现有 VLESS/CF 配合）。
+2. 保存最新 endpoint 和经控制面验证的 A 证书/指纹；A 证书更换必须由管理员重新确认信任，不能悄然切换。
+3. 控制面更新**同一个** endpoint 不断开有效 QUIC；只有真正变化才通知连接循环更换目标。
+4. WARP SOCKS5 UDP relay 关闭、QUIC 心跳失效或 endpoint 更新后自动重建连接。
+5. Web UI 只能在 **QUIC/TLS + data_psk 会话认证** 全部成功后显示 `DATA_ACTIVE`。
+
+## 5. 配置、密钥和运行方式
+
+从根目录运行：
 
 ```text
-光猫/路由器 UDP 39999 -> A 内网 IP:39999
+python -m pip install -r requirements.txt
+python -m mytrn init a          # A 上创建随机控制/数据/管理密钥
+python -m mytrn init b          # B 上创建独立配置
+python -m mytrn a               # A 前台运行
+python -m mytrn b               # B 前台运行
 ```
 
-光猫/路由器前面还有电信上层 NAT1 / full-cone NAT。A 使用同一个 UDP socket 访问 STUN 后，得到 B 端真正应该连接的公网 endpoint，例如：
+把 A 的 `control_token`、`data_psk` 配到 B；B 的 `admin_token` 独立。Web UI：A `127.0.0.1:18881`，B `127.0.0.1:18882`；配置 JSON 保存重启生效。真实配置 `config.a.json`、`config.b.json`、证书私钥、状态目录在 `.gitignore` 中。
 
-```text
-119.98.144.218:55781
-```
+配置要求：
 
-注意：`39999` 是 A 内网和家里路由器侧的端口；B 端真正要打的是 STUN 观测到的公网 endpoint，例如 `119.98.144.218:55781`。
+- **严格校验**：不接受未识别、缺失的配置字段或未知的转发规则字段；删除 `allow_private_endpoint` 等仅为测试引入的开关。
+- `control_bind`、`control_port`、`web_bind`、`web_port` 等均按明确角色配置。Web UI 默认回环地址，不公开部署。
+- A `targets`、B `forwards` 一一按规则 ID 配对；业务监听默认 B 回环地址。不要在无防火墙与鉴权防护下暴露 B Web UI、控制 API 或业务端口到公网。
 
-### B 端：境外 VPS
+参见 [`README.md`](README.md) 和 `config.*.example.json`。
 
-B 的公网 IP 可能被 GFW 直接限制，但 A 可以通过 CF/VLESS 控制链访问 B 的 HTTP 控制端。
+## 6. 验证门槛
 
-B 本机存在 WARP SOCKS5 代理：
+### 已知历史验证（旧探测器）
 
-```text
-socks5://127.0.0.1:40000
-```
+- A 的 CF/VLESS 控制连接通 B：通过。
+- A 的 STUN 映射观测：通过。
+- B 的 WARP SOCKS5 `UDP ASSOCIATE` 和经 WARP 的 STUN：通过。
+- B WARP UDP → A NAT 映射、A 直接应答 → B：5/5 通过。
 
-该代理已验证支持 SOCKS5 `UDP ASSOCIATE`，并能通过 WARP 访问公网 STUN。
+### MVP 自动化回归（离线真实 socket）
 
-## 4. 目标架构
+- A/B 经模拟 SOCKS5 UDP relay 和 STUN 建立加密 QUIC/TCP echo，验证实际数据转发。
+- **100 次连续短 TCP 连接**，双向完成后无 stream 残留。
+- **40 次目标拒绝连接后恢复服务**，资源不泄漏，新连接能成功。
+- 正确头部与大块 TCP payload 合并到达不应误判超长；超长头应拒绝。
+- `data_psk` 不一致时，QUIC 握手可能成功，但不能进入 `DATA_ACTIVE`，业务不可用。
+- 控制 token 错误、A 证书错误、错误配置键、A/B 启停与 B 状态恢复。
+- endpoint 真实变化、WARP UDP relay 中断后恢复和未认证会话短超时需要独立回归验证。
+- GitHub Actions 要求 Windows 与 Linux 的 Python 3.13 测试通过。
 
-```text
-                 A 内网机器
-              UDP local :39999
-                    │
-                    │ 路由器端口映射
-                    ▼
-          光猫/路由器 UDP 39999
-                    │
-                    │ 电信 NAT1 / full-cone
-                    ▼
-          A public endpoint: IP:PORT
-                    ▲
-                    │
-                    │ 数据面
-                    │
-B agent -> WARP SOCKS5 UDP -> Cloudflare/WARP egress
+### 尚需用户真实环境验证
 
-控制面：
-A agent -> v2rayN SOCKS5 -> VLESS -> CF CDN -> B control HTTP
-```
+- 国内电信 NAT1/家用光猫映射 ↔ 境外 B 的 WARP SOCKS5 QUIC 实测。
+- 长时间运行（6 小时和 24 小时），记录断线恢复时间、endpoint 变化、RTT、丢包、代理重建次数、内存/连接占用。
+- 实际 endpoint 变化后几分钟内恢复为目标，不在缺少实网观测时宣称达标。
 
-## 5. 设计原则
+## 7. 后续阶段（MVP 通过之后）
 
-1. **控制面低频化**
-   - A 启动时注册一次。
-   - endpoint 变化时重新注册。
-   - 可选每 10~30 分钟 refresh 一次，防止 B 重启后丢失状态。
-   - 不做高频 status poll。
-
-2. **数据面常驻化**
-   - B 通过 WARP SOCKS5 UDP 向 A 当前 endpoint 发 ping/payload。
-   - A 回复实际 packet source。
-   - 数据面负责 RTT、丢包、连续失败次数和存活状态。
-
-3. **公网 endpoint 以 STUN 实测为准**
-   - A 固定绑定本地 UDP 端口。
-   - A 使用同一个 socket 访问 STUN。
-   - 只有 STUN endpoint 变化时才触发控制面上报。
-
-4. **不租第三方 C 节点**
-   - 不引入独立公网 rendezvous VPS。
-   - 现有 CF/VLESS 到 B 的链路承担最小控制面职责。
-
-5. **失败可定位**
-   - 区分控制面失败、STUN 失败、WARP SOCKS5 UDP 失败、A endpoint 失效、路由器端口映射失败。
-
-## 6. A agent 计划
-
-A agent 职责：
-
-```text
-1. 固定绑定 UDP local-port，例如 39999。
-2. 使用同一个 socket 做 STUN。
-3. 获取公网 endpoint，例如 119.98.144.218:55781。
-4. 通过 CF/VLESS 控制面注册给 B。
-5. 周期性 STUN 检查 endpoint 是否变化。
-6. endpoint 未变时不访问控制面。
-7. endpoint 变化时重新注册。
-8. 接收 B 的 UDP 数据面包并回复。
-```
-
-建议参数：
-
-```text
---key <shared-secret>
---local-port 39999
---stun stun.cloudflare.com:3478
---control-socks5 socks5://127.0.0.1:10810
---control-host <B-control-host>
---control-port 18080
---stun-check-interval 30
---register-refresh-interval 1800
---endpoint-change-confirm 2
-```
-
-endpoint 变化确认逻辑：
-
-```text
-1. 每 30 秒做一次 STUN check。
-2. 如果新 endpoint 与当前注册 endpoint 不同，记录为候选 endpoint。
-3. 连续 2 次得到同一个新 endpoint 后，确认变更。
-4. 通过控制面向 B 重新注册。
-```
-
-## 7. B agent 计划
-
-B agent 职责：
-
-```text
-1. 启动 HTTP 控制面，等待 A 注册 endpoint。
-2. 保存当前 A endpoint。
-3. 连接本机 WARP SOCKS5：socks5://127.0.0.1:40000。
-4. 使用 SOCKS5 UDP ASSOCIATE 建立 UDP relay。
-5. 向 A endpoint 发送 ping/payload。
-6. 接收 A 回复，统计 RTT、丢包和连续失败次数。
-7. endpoint 失效时进入 degraded 状态，继续等待 A 重新注册。
-```
-
-建议参数：
-
-```text
---key <shared-secret>
---control-bind 0.0.0.0
---control-port 18080
---warp-socks5 socks5://127.0.0.1:40000
---ping-interval 5
---probe-timeout 5
---max-failures 3
-```
-
-B 状态机：
-
-```text
-WAIT_ENDPOINT
-  等待 A 注册 endpoint
-
-DATA_ACTIVE
-  通过 WARP SOCKS5 UDP 与 A ping/pong 或传输 payload
-
-DATA_DEGRADED
-  连续 ping 超时，旧 endpoint 可能失效
-  继续低频探测旧 endpoint，同时等待 A 新注册
-
-RECONNECTED
-  收到新 endpoint 或旧 endpoint 恢复，回到 DATA_ACTIVE
-```
-
-## 8. 控制面 API 草案
-
-### `GET /register`
-
-A 启动时调用，声明节点在线。
-
-```text
-key=<shared-secret>
-node=<node-id>
-```
-
-### `GET /mapping`
-
-A 上报或更新公网 UDP endpoint。
-
-```text
-key=<shared-secret>
-node=<node-id>
-nat_ip=<public-ip>
-nat_port=<public-port>
-local_port=<local-udp-port>
-reason=startup|changed|refresh
-```
-
-### `GET /status`
-
-仅调试使用，生产模式建议关闭或限制访问。
-
-返回示例：
-
-```json
-{
-  "node": "a-node-1",
-  "endpoint": "119.98.144.218:55781",
-  "data_state": "DATA_ACTIVE",
-  "last_register": "...",
-  "last_data_seen": "...",
-  "rtt_ms": {
-    "min": 120,
-    "avg": 180,
-    "max": 300
-  }
-}
-```
-
-## 9. 数据面包格式草案
-
-探测阶段继续使用文本包，便于调试：
-
-```text
-PING <key> <seq> <timestamp_ns>
-PONG <key> <seq> <timestamp_ns> <observed_src_ip> <observed_src_port>
-```
-
-后续改为二进制帧：
-
-```text
-magic       4 bytes
-version     1 byte
-type        1 byte
-flags       2 bytes
-session_id  8 bytes
-seq         8 bytes
-timestamp   8 bytes
-payload_len 2 bytes
-payload     N bytes
-auth_tag    16 bytes
-```
-
-包类型：
-
-```text
-0x01 PING
-0x02 PONG
-0x03 DATA
-0x04 ACK
-0x05 CLOSE
-```
-
-## 10. 安全计划
-
-探测阶段可以使用共享 `key` 匹配。长期运行需要增强：
-
-```text
-1. 控制面使用长随机 token。
-2. 数据面使用 session key。
-3. 数据包加入 HMAC，防止伪造。
-4. 加入 timestamp / nonce，降低重放风险。
-5. B control bind 到 0.0.0.0 时必须使用强 token。
-6. /status 默认关闭或仅本机访问。
-7. 日志不打印 token、密钥或完整敏感配置。
-```
-
-## 11. 验证计划
-
-### 11.1 已完成
-
-```text
-A -> CF/VLESS -> B 控制面：通过
-A STUN 获取公网 endpoint：通过
-B WARP SOCKS5 UDP ASSOCIATE：通过
-B 通过 WARP SOCKS5 UDP 命中 A endpoint：通过
-A 观察到 Cloudflare/WARP 出口来源：通过
-双向 UDP probe 5/5：通过
-```
-
-### 11.2 下一步
-
-1. **低频控制面验证**
-   - A 注册一次后不再频繁 poll。
-   - B 仅通过数据面 ping/pong 判断存活。
-
-2. **endpoint 变化验证**
-   - 重启路由器或重新拨号。
-   - A 检测 STUN endpoint 变化。
-   - A 自动通过控制面重新注册。
-   - B 自动切换到新 endpoint。
-
-3. **长稳验证**
-   - 连续运行 6 小时和 24 小时。
-   - 记录 endpoint 变化次数、丢包率、RTT、重连次数。
-
-4. **故障恢复验证**
-   - 重启 B agent。
-   - 重启 A agent。
-   - 重启 WARP SOCKS5 服务。
-   - 临时断开 A 网络后恢复。
-
-## 12. 实施阶段
-
-### Phase 1：探测脚本整理
-
-- 保留已验证的 STUN、控制面注册、WARP SOCKS5 UDP ASSOCIATE 逻辑。
-- 去掉 A 高频 control poll。
-- 统一参数和日志输出。
-
-### Phase 2：agent MVP
-
-交付：
-
-```text
-agent_a.py
-agent_b.py
-config.example.yaml
-```
-
-能力：
-
-```text
-A：启动注册、STUN 检测、endpoint 变化上报、UDP PONG
-B：控制面接收 endpoint、WARP SOCKS5 UDP PING、状态机
-```
-
-### Phase 3：稳定性与恢复
-
-- endpoint 变化确认机制。
-- B 数据面超时降级。
-- A 低频 refresh。
-- WARP SOCKS5 UDP relay 自动重建。
-- 日志轮转和基础 metrics。
-
-### Phase 4：真实数据封装
-
-- 将 PING/PONG 扩展为 DATA 帧。
-- 设计 session、seq、ack、重传或 FEC。
-- 评估接入 SOCKS/TUN/UDP forward。
-
-## 13. 风险与待确认事项
-
-```text
-1. 电信 NAT1 公网 endpoint 是否长期稳定。
-2. 光猫/路由器端口映射重启后是否保留。
-3. A 内网 IP 是否固定，建议 DHCP 绑定。
-4. WARP SOCKS5 UDP ASSOCIATE relay 是否会超时。
-5. 美国 VPS 到中国链路 RTT 高是正常现象，需要长稳数据判断实际可用性。
-6. B control 暴露到 0.0.0.0 时需要更强鉴权。
-```
-
-## 14. 推荐默认参数
-
-```text
-A local UDP port:              39999
-STUN server:                   stun.cloudflare.com:3478
-STUN check interval:           30s
-STUN change confirm count:     2
-Control refresh interval:      1800s
-B WARP SOCKS5:                 socks5://127.0.0.1:40000
-B ping interval:                5s
-B probe timeout:                5s
-B max consecutive failures:     3
-```
-
-## 15. 当前结论
-
-当前测试结果支持继续推进该方案：
-
-```text
-CF/VLESS = 低频控制面
-STUN = A endpoint 发现与变化检测
-WARP SOCKS5 UDP = B 到 A 的长期数据面
-路由器端口映射 = A 内网入口放行
-```
-
-下一步应从探测脚本进入长期 agent MVP，实现：
-
-```text
-启动注册一次
-endpoint 变化才上报
-数据面 ping/pong 保活
-控制面低频 refresh
-```
-
-## 16. MVP 实施决策（覆盖此前阶段性草案，2026-10-08）
-
-用户确认第一版直接实现**真实指定端口转发**，而不止 PING/PONG。实际方向必须保持：**B 通过 WARP SOCKS5 UDP 主动拨入 A 的公网映射**；不把 B 的公网业务端口暴露视为必要前提。
-
-- 第一版：单 A（Windows / Python 3.13）和单 B（Linux）；A 内网固定、UDP 39999 与路由器长期转发固定，断线后自动恢复；不做服务化。
-- 业务：B 本机按端口白名单接收指定 TCP 连接，封装成 QUIC 可靠流，经 B 的 WARP SOCKS5 UDP 连接到 A；A 只能转发至自身配置中允许的目标 TCP 主机/端口。B 业务监听默认绑定 `127.0.0.1`，**不是对公网开放端口**。
-- QUIC 自带加密、重传、流量控制和多路复用；不再自行设计不可靠的明文 TCP-over-UDP 重传格式。A 使用 TLS 证书，B 从已认证控制面获取并固定 A 的证书，数据流另由共享 HMAC 鉴权。
-- A 启动后立即用相同 UDP socket 进行 STUN；正常情况下低频检测和 keepalive；检测两次新映射后通过 CF/VLESS 发送一次控制面更新。B 从本地保存的 endpoint 自动恢复；数据面 QUIC PING 负责存活判断。
-- 配置通过 A/B 各自本机 Web UI 编辑 JSON 并落盘，修改后重启 agent 生效；Web UI 默认监听 loopback，控制端口可配置。不提交真实配置、私钥和 token。
-- 第一版**先支持指定 TCP 端口**，UDP 业务端口代理、TUN、多节点、多机服务、热配置及生产级压力优化留待后续。协议和目录详情以实际 `README.md`、源码和测试为准。
+1. 优化真实中美网络下 QUIC 参数与监控，补齐长稳和异常网络覆盖。
+2. 按需求决定是否加入指定 UDP 业务端口转发，而不是提前开发全局代理。
+3. 仅在明确需要时考虑服务化、Web 配置热更新、性能与安全加固；不扩展为多节点或复杂平台。

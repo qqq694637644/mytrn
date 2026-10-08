@@ -18,6 +18,18 @@ from cryptography.x509.oid import NameOID
 
 SERVER_NAME = "mytrn-a"
 RULE_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+COMMON_KEYS = {"role", "control_token", "data_psk", "admin_token", "web_bind", "web_port", "state_dir", "control_port"}
+A_KEYS = {"local_udp_bind", "local_udp_port", "stun_servers", "stun_check_interval",
+          "stun_keepalive_interval", "endpoint_change_confirm", "register_refresh_interval",
+          "control_retry_interval", "control_socks5", "control_host", "targets"}
+B_KEYS = {"control_bind", "warp_socks5", "ping_interval", "reconnect_interval", "max_failures", "forwards"}
+
+
+def exact_keys(value: dict, expected: set[str], description: str) -> None:
+    unknown = set(value) - expected
+    missing = expected - set(value)
+    if unknown or missing:
+        raise ValueError(f"{description} keys invalid: unknown={sorted(unknown)}, missing={sorted(missing)}")
 
 
 def defaults(role: str) -> dict[str, Any]:
@@ -89,6 +101,9 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def validate_config(c: dict[str, Any], role: str) -> None:
+    if not isinstance(c, dict):
+        raise ValueError("configuration must be a JSON object")
+    exact_keys(c, COMMON_KEYS | (A_KEYS if role == "a" else B_KEYS), f"{role.upper()} config")
     if c.get("role") != role:
         raise ValueError(f"config role must be {role!r}")
     for name in ("control_token", "data_psk", "admin_token"):
@@ -104,13 +119,15 @@ def validate_config(c: dict[str, Any], role: str) -> None:
         if not isinstance(c.get(name), str) or not c[name]:
             raise ValueError(f"{name} required")
     if role == "a":
+        if not isinstance(c.get("local_udp_bind"), str) or not c["local_udp_bind"]:
+            raise ValueError("local_udp_bind required")
         if type(c.get("local_udp_port")) is not int or not 1 <= c["local_udp_port"] <= 65535:
             raise ValueError("local_udp_port must be 1..65535")
         if not isinstance(c.get("stun_servers"), list) or not c["stun_servers"]:
             raise ValueError("at least one STUN server required")
         if not all(isinstance(s, str) and s for s in c["stun_servers"]):
             raise ValueError("invalid STUN server")
-        if not c.get("control_socks5", "").startswith("socks5://"):
+        if not isinstance(c.get("control_socks5"), str) or not c["control_socks5"].startswith("socks5://"):
             raise ValueError("control_socks5 must start with socks5://")
         if not isinstance(c.get("control_host"), str) or not c["control_host"]:
             raise ValueError("control_host required")
@@ -127,10 +144,11 @@ def validate_config(c: dict[str, Any], role: str) -> None:
                 raise ValueError("invalid target rule id")
             if not isinstance(target, dict) or not isinstance(target.get("host"), str) or not target["host"]:
                 raise ValueError(f"invalid target for {rule}")
+            exact_keys(target, {"host", "port"}, f"target {rule}")
             if type(target.get("port")) is not int or not 1 <= target["port"] <= 65535:
                 raise ValueError(f"invalid target port for {rule}")
     else:
-        if not c.get("warp_socks5", "").startswith("socks5://"):
+        if not isinstance(c.get("warp_socks5"), str) or not c["warp_socks5"].startswith("socks5://"):
             raise ValueError("warp_socks5 must start with socks5://")
         if not isinstance(c.get("control_bind"), str) or not c["control_bind"]:
             raise ValueError("control_bind required")
@@ -144,8 +162,9 @@ def validate_config(c: dict[str, Any], role: str) -> None:
             raise ValueError("forwards must be a list")
         seen = set()
         for rule in forwards:
-            if not isinstance(rule, dict) or not RULE_ID.fullmatch(str(rule.get("id", ""))):
+            if not isinstance(rule, dict) or not isinstance(rule.get("id"), str) or not RULE_ID.fullmatch(rule["id"]):
                 raise ValueError("invalid forwarding rule id")
+            exact_keys(rule, {"id", "listen_host", "listen_port"}, f"forward {rule['id']}")
             if not isinstance(rule.get("listen_host"), str) or not rule["listen_host"]:
                 raise ValueError("listen_host required")
             if type(rule.get("listen_port")) is not int or not 1 <= rule["listen_port"] <= 65535:

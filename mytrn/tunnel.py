@@ -9,6 +9,7 @@ opened by mytrn.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -30,6 +31,7 @@ LOG = logging.getLogger("mytrn.tunnel")
 ALPN = "mytrn/1"
 MAX_ACTIVE_STREAMS = 32
 MAX_BUFFERED_PER_STREAM = 512 * 1024
+UNAUTHENTICATED_TIMEOUT = 20.0
 
 
 def make_server_quic_config(certfile: str, keyfile: str) -> QuicConfiguration:
@@ -50,6 +52,10 @@ def stream_proof(psk: str, rule: str, timestamp: int, nonce: str) -> str:
     return hmac.new(psk.encode(), f"{rule}|{timestamp}|{nonce}".encode(), hashlib.sha256).hexdigest()
 
 
+def session_proof(psk: str, timestamp: int, nonce: str) -> str:
+    return hmac.new(psk.encode(), f"mytrn/session/v1|{timestamp}|{nonce}".encode(), hashlib.sha256).hexdigest()
+
+
 class QuicSession:
     """Run aioquic's I/O-independent state machine over an arbitrary UDP sender."""
 
@@ -60,8 +66,11 @@ class QuicSession:
         self.peer = peer
         self.on_new_stream = on_new_stream
         self.connected = asyncio.Event()
+        self.authenticated = asyncio.Event()
         self.closed = asyncio.Event()
         self.streams: dict[int, asyncio.Queue] = {}
+        self._retired_streams: set[int] = set()
+        self._retired_order: deque[int] = deque()
         self.last_packet_at = time.monotonic()
         self.last_ping_at = 0.0
         self.last_pong_at = 0.0
@@ -128,6 +137,8 @@ class QuicSession:
                 self.error = event.reason_phrase or f"QUIC code={event.error_code}"
                 self._finish()
             elif isinstance(event, StreamDataReceived):
+                if event.stream_id in self._retired_streams:
+                    continue
                 queue = self.streams.get(event.stream_id)
                 if queue is None:
                     if len(self.streams) >= MAX_ACTIVE_STREAMS:
@@ -158,15 +169,30 @@ class QuicSession:
             except asyncio.QueueFull:
                 pass
 
-    def new_stream(self):
+    def new_stream(self, *, authentication: bool = False):
         if not self.connected.is_set() or self.closed.is_set():
             raise ConnectionError("QUIC data plane is not connected")
+        if not authentication and not self.authenticated.is_set():
+            raise PermissionError("QUIC session not authenticated")
         if len(self.streams) >= MAX_ACTIVE_STREAMS:
             raise ConnectionError("maximum active streams reached")
         stream_id = self.quic.get_next_available_stream_id()
         queue = asyncio.Queue(maxsize=256)
         self.streams[stream_id] = queue
         return stream_id, queue
+
+    def finish_stream(self, stream_id: int):
+        """Release application stream resources; ignore any late QUIC events.
+
+        The bounded retired-ID cache avoids resurrecting a stream after its
+        handler has exited without growing for the full daemon lifetime.
+        """
+        self.streams.pop(stream_id, None)
+        if stream_id not in self._retired_streams:
+            if len(self._retired_order) >= 4096:
+                self._retired_streams.discard(self._retired_order.popleft())
+            self._retired_order.append(stream_id)
+            self._retired_streams.add(stream_id)
 
     def send_stream(self, stream_id: int, data: bytes, end=False):
         if self.closed.is_set():
@@ -197,6 +223,14 @@ class QuicSession:
             self.quic.send_ping(self._ping_uid)
             self.flush()
 
+    def abort(self, reason: str):
+        """Abort without awaiting/cancelling the currently executing stream task."""
+        if not self.closed.is_set():
+            self.error = reason
+            self.quic.close(reason_phrase=reason)
+            self.flush()
+            self._finish()
+
     async def close(self):
         if not self.closed.is_set():
             self.quic.close(reason_phrase="shutdown")
@@ -221,6 +255,17 @@ class AQuicServer:
         self.session: QuicSession | None = None
         self.original_cid: bytes | None = None
         self.last_accept = 0.0
+        self._auth_expiry: asyncio.Task | None = None
+
+    async def _expire_untrusted(self, candidate: QuicSession):
+        try:
+            await asyncio.sleep(UNAUTHENTICATED_TIMEOUT)
+            if not candidate.authenticated.is_set() and not candidate.closed.is_set():
+                LOG.warning("A closing QUIC session that did not authenticate within %.0fs",
+                            UNAUTHENTICATED_TIMEOUT)
+                await candidate.close()
+        except asyncio.CancelledError:
+            pass
 
     def receive(self, packet: bytes, src: tuple):
         try:
@@ -229,13 +274,18 @@ class AQuicServer:
             return
         new_initial = header.packet_type == QuicPacketType.INITIAL and header.destination_cid != self.original_cid
         if new_initial:
-            # Never displace a healthy session with unauthenticated Initial packets.
-            if self.session and not self.session.closed.is_set() and time.monotonic() - self.session.last_packet_at < 12:
+            # Only a previously PSK-authenticated session gets protection.
+            # An untrusted Initial cannot reserve the only session indefinitely.
+            if (self.session and not self.session.closed.is_set() and
+                    self.session.authenticated.is_set() and
+                    time.monotonic() - self.session.last_packet_at < 12):
                 return
-            if time.monotonic() - self.last_accept < 2:
+            if time.monotonic() - self.last_accept < 1:
                 return
             if self.session:
                 asyncio.create_task(self.session.close())
+            if self._auth_expiry:
+                self._auth_expiry.cancel()
             try:
                 quic = QuicConnection(configuration=self.config,
                                       original_destination_connection_id=header.destination_cid)
@@ -248,11 +298,15 @@ class AQuicServer:
             # processed the first Initial. Flush only *after* receive_datagram.
             self.session.receive(packet, src)
             self.session.start()
+            self._auth_expiry = asyncio.create_task(self._expire_untrusted(self.session))
             return
         if self.session and not self.session.closed.is_set():
             self.session.receive(packet, src)
 
     async def close(self):
+        if self._auth_expiry:
+            self._auth_expiry.cancel()
+            await asyncio.gather(self._auth_expiry, return_exceptions=True)
         if self.session:
             await self.session.close()
 
@@ -260,15 +314,19 @@ class AQuicServer:
 async def pull_line(queue: asyncio.Queue, max_bytes=1024) -> tuple[bytes, bytes, bool]:
     """Read one newline-delimited stream header, retaining trailing data."""
     buff = bytearray()
-    while b"\n" not in buff:
+    while True:
         data, end = await queue.get()
         buff.extend(data)
+        newline = buff.find(b"\n")
+        if newline >= 0:
+            if newline > max_bytes:
+                raise ValueError("stream header exceeds 1024 bytes")
+            line, remainder = bytes(buff[:newline]), bytes(buff[newline + 1:])
+            return line, remainder, end
         if len(buff) > max_bytes:
             raise ValueError("stream header exceeds 1024 bytes")
-        if end and b"\n" not in buff:
+        if end:
             raise EOFError("stream ended before header")
-    line, remainder = bytes(buff).split(b"\n", 1)
-    return line, remainder, end
 
 
 async def bridge_stream(session: QuicSession, sid: int, queue: asyncio.Queue,
@@ -310,21 +368,20 @@ async def bridge_stream(session: QuicSession, sid: int, queue: asyncio.Queue,
     outbound = asyncio.create_task(tcp_to_quic())
     terminated = asyncio.create_task(session.closed.wait())
     try:
-        done, pending = await asyncio.wait((inbound, outbound, terminated), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait((inbound, outbound, terminated), return_when=asyncio.FIRST_COMPLETED)
         if terminated in done or any(t.exception() for t in done if t is not terminated and not t.cancelled()):
-            for task in pending:
-                task.cancel()
-        else:
-            # A TCP half-close is legitimate. Give the other direction time to finish.
-            await asyncio.wait((inbound, outbound, terminated), timeout=60, return_when=asyncio.ALL_COMPLETED)
+            return
+        # A half-close is normal; wait for the *other I/O direction* to finish,
+        # or for the QUIC session to terminate. Do not wait for termination of
+        # the whole session once both TCP directions have ended.
+        if not (inbound.done() and outbound.done()):
+            other = outbound if inbound in done else inbound
+            await asyncio.wait((other, terminated), timeout=60, return_when=asyncio.FIRST_COMPLETED)
     finally:
         for task in (inbound, outbound, terminated):
             if not task.done():
                 task.cancel()
         await asyncio.gather(inbound, outbound, terminated, return_exceptions=True)
-        writer.close()
-        await writer.wait_closed()
-        session.streams.pop(sid, None)
 
 
 class AStreamHandler:
@@ -332,11 +389,50 @@ class AStreamHandler:
         self.targets = targets
         self.data_psk = data_psk
         self.seen_nonces: dict[str, float] = {}
+        self.auth_nonces: dict[str, float] = {}
 
     async def __call__(self, session: QuicSession, sid: int, queue: asyncio.Queue):
+        if sid == 0:
+            await self._authenticate(session, sid, queue)
+        else:
+            await self._forward(session, sid, queue)
+
+    async def _authenticate(self, session: QuicSession, sid: int, queue: asyncio.Queue):
         try:
+            line, extra, ended = await asyncio.wait_for(pull_line(queue), 10)
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("session authentication must be a JSON object")
+            timestamp = request.get("ts")
+            nonce = request.get("nonce")
+            mac = request.get("mac")
+            now = time.time()
+            if (request.get("type") != "AUTH" or extra or not ended or
+                type(timestamp) is not int or abs(now - timestamp) > 120 or
+                not isinstance(nonce, str) or not 16 <= len(nonce) <= 64 or
+                nonce in self.auth_nonces or not isinstance(mac, str) or
+                not hmac.compare_digest(mac, session_proof(self.data_psk, timestamp, nonce))):
+                raise PermissionError("invalid session authentication")
+            self.auth_nonces = {n: t for n, t in self.auth_nonces.items() if now - t < 180}
+            self.auth_nonces[nonce] = now
+            session.authenticated.set()
+            session.send_stream(sid, b"OK\n", end=True)
+            LOG.info("A authenticated B QUIC session")
+        except (ValueError, OSError, asyncio.TimeoutError, EOFError, TypeError) as exc:
+            LOG.warning("A rejected unauthenticated QUIC session: %s", exc)
+            session.abort("session authentication failed")
+        finally:
+            session.finish_stream(sid)
+
+    async def _forward(self, session: QuicSession, sid: int, queue: asyncio.Queue):
+        writer = None
+        try:
+            if not session.authenticated.is_set():
+                raise PermissionError("session not authenticated")
             line, remaining, ended = await asyncio.wait_for(pull_line(queue), 10)
             request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("stream OPEN must be a JSON object")
             rule = request.get("rule", "")
             timestamp = request.get("ts", 0)
             nonce = request.get("nonce", "")
@@ -352,27 +448,53 @@ class AStreamHandler:
             self.seen_nonces[nonce] = now
             target = self.targets[rule]
             reader, writer = await asyncio.wait_for(asyncio.open_connection(target["host"], target["port"]), 8)
-        except Exception as exc:
-            LOG.warning("A rejected forwarding stream %s: %s", sid, exc)
-            try:
-                session.send_stream(sid, b"ERR\n", end=True)
-            except ConnectionError:
-                pass
-            session.streams.pop(sid, None)
-            return
-        LOG.info("A accepted stream %s to allowlisted target %s:%s", sid, target["host"], target["port"])
-        try:
+            LOG.info("A accepted stream %s to allowlisted target %s:%s", sid, target["host"], target["port"])
             session.send_stream(sid, b"OK\n")
             await bridge_stream(session, sid, queue, reader, writer, remaining, ended)
-        except (ConnectionError, OSError):
-            pass
+        except (ConnectionError, OSError, ValueError, EOFError, asyncio.TimeoutError, TypeError) as exc:
+            LOG.warning("A rejected or closed forwarding stream %s: %s", sid, exc)
+            if writer is None and not session.closed.is_set():
+                try:
+                    session.send_stream(sid, b"ERR\n", end=True)
+                except ConnectionError:
+                    pass
+        finally:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            session.finish_stream(sid)
+
+
+async def authenticate_client(session: QuicSession, data_psk: str, timeout: float = 15):
+    """First client-initiated QUIC stream must validate the data PSK."""
+    sid = None
+    try:
+        sid, queue = session.new_stream(authentication=True)
+        if sid != 0:
+            raise ConnectionError("expected QUIC session authentication on stream 0")
+        timestamp = int(time.time())
+        nonce = secrets.token_hex(12)
+        request = {"type": "AUTH", "ts": timestamp, "nonce": nonce,
+                   "mac": session_proof(data_psk, timestamp, nonce)}
+        session.send_stream(sid, json.dumps(request, separators=(",", ":")).encode() + b"\n", end=True)
+        try:
+            response, extra, ended = await asyncio.wait_for(pull_line(queue), timeout)
+        except EOFError as exc:
+            raise PermissionError("QUIC closed before data_psk authentication") from exc
+        if response != b"OK" or extra or not ended or session.closed.is_set():
+            raise PermissionError("A rejected data_psk session authentication")
+        session.authenticated.set()
+    finally:
+        if sid is not None:
+            session.finish_stream(sid)
 
 
 async def b_forward_tcp(session: QuicSession, rule: str, data_psk: str,
                         reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    if not session.connected.is_set() or session.closed.is_set():
+    if not session.authenticated.is_set() or session.closed.is_set():
         writer.close(); await writer.wait_closed()
         return
+    sid = None
     try:
         sid, queue = session.new_stream()
         timestamp = int(time.time())
@@ -386,7 +508,10 @@ async def b_forward_tcp(session: QuicSession, rule: str, data_psk: str,
         if response != b"OK":
             raise ConnectionError("A refused allowlisted TCP target")
         await bridge_stream(session, sid, queue, reader, writer, remaining, ended)
-    except (OSError, ValueError, asyncio.TimeoutError, ConnectionError) as exc:
+    except (OSError, ValueError, EOFError, asyncio.TimeoutError, ConnectionError) as exc:
         LOG.warning("B local forwarding %s failed: %s", rule, exc)
+    finally:
+        if sid is not None:
+            session.finish_stream(sid)
         writer.close()
         await writer.wait_closed()

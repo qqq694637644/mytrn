@@ -17,7 +17,7 @@ from .config import (certificate_fingerprint, ensure_a_certificate, load_json,
                      save_json, state_path, validate_config)
 from .network import RawUDP, SocksUDP, StunClient, control_post
 from .tunnel import (AQuicServer, AStreamHandler, QuicSession, b_forward_tcp,
-                     make_client_quic_config, make_server_quic_config)
+                     authenticate_client, make_client_quic_config, make_server_quic_config)
 
 LOG = logging.getLogger("mytrn.agent")
 
@@ -90,10 +90,10 @@ class Agent:
         status = dict(self.status)
         if self.role == "a" and self.quic_server:
             session = self.quic_server.session
-            status["quic_connected"] = bool(session and session.connected.is_set() and not session.closed.is_set())
+            status["quic_connected"] = bool(session and session.authenticated.is_set() and not session.closed.is_set())
             status["last_data_packet"] = round(session.last_packet_at, 1) if session else None
         if self.role == "b" and self.session:
-            status["quic_connected"] = self.session.connected.is_set() and not self.session.closed.is_set()
+            status["quic_connected"] = self.session.authenticated.is_set() and not self.session.closed.is_set()
             status["last_pong_age_seconds"] = round(time.monotonic() - self.session.last_pong_at, 1)
         return web.json_response(status)
 
@@ -189,6 +189,10 @@ class Agent:
                             registration_required = True
                             self._pending_endpoint = None
                             self._pending_count = 0
+                            # Old QUIC path no longer represents the mapped
+                            # address. Make room for the B-initiated reconnect.
+                            if self.quic_server and self.quic_server.session:
+                                await self.quic_server.session.close()
                     else:
                         self._pending_endpoint = None
                         self._pending_count = 0
@@ -231,8 +235,8 @@ class Agent:
             value = await request.json()
             ip = ipaddress.ip_address(value["ip"])
             port = value["port"]
-            if ip.version != 4 or (not ip.is_global and not self.config.get("allow_private_endpoint", False)):
-                raise ValueError("expected global IPv4 endpoint")
+            if ip.version != 4 or ip.is_unspecified or ip.is_multicast:
+                raise ValueError("expected valid unicast IPv4 endpoint")
             if type(port) is not int or not 1 <= port <= 65535:
                 raise ValueError("invalid port")
             pem = value["certificate"]
@@ -273,7 +277,11 @@ class Agent:
         LOG.info("B control HTTP listening on %s:%s", self.config["control_bind"], self.config["control_port"])
         for rule in self.config["forwards"]:
             async def accept(reader, writer, rule_id=rule["id"]):
-                await b_forward_tcp(self.session, rule_id, self.config["data_psk"], reader, writer) if self.session else writer.close()
+                if self.session:
+                    await b_forward_tcp(self.session, rule_id, self.config["data_psk"], reader, writer)
+                else:
+                    writer.close()
+                    await writer.wait_closed()
             server = await asyncio.start_server(accept, rule["listen_host"], rule["listen_port"])
             self.locals.append(server)
             LOG.info("B local TCP %s:%s -> A rule '%s'", rule["listen_host"], rule["listen_port"], rule["id"])
@@ -326,9 +334,13 @@ class Agent:
                     await asyncio.gather(handshake, changed, proxy_lost, return_exceptions=True)
                 if session.closed.is_set():
                     raise ConnectionError(session.error or "QUIC handshake terminated")
-                LOG.info("B QUIC active via WARP SOCKS5 -> A %s:%s", *peer)
+                await authenticate_client(session, c["data_psk"])
+                if session.closed.is_set() or not session.authenticated.is_set():
+                    raise PermissionError("QUIC session data_psk authentication failed")
+                LOG.info("B authenticated QUIC active via WARP SOCKS5 -> A %s:%s", *peer)
                 self.status["state"] = "DATA_ACTIVE"
                 self.status["quic_connected"] = True
+                self.status["last_error"] = None
                 while not self.shutdown.is_set() and not session.closed.is_set():
                     if self.peer_changed.is_set() or socks.closed.is_set():
                         break
@@ -341,7 +353,7 @@ class Agent:
                         pass
                 if session.closed.is_set():
                     raise ConnectionError(session.error or "QUIC closed")
-            except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as exc:
+            except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError, EOFError, ValueError) as exc:
                 self.status["last_error"] = str(exc)
                 self.status["state"] = "DATA_DEGRADED"
                 LOG.warning("B data plane reconnect needed: %s", exc)
