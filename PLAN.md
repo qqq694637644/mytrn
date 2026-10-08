@@ -1,143 +1,253 @@
-# mytrn — 单 A / 单 B UDP 隧道与指定 TCP 端口转发计划
+# mytrn — Xray-core 反向代理上网架构与实施计划
 
-> 当前唯一有效的实现计划。与已淘汰的 HTTP GET、自定义 DATA/ACK 帧、第三方 rendezvous、B 公网被动入口等旧设计不兼容，也不保留兼容层。
+> **状态：目标架构 / 待实现；不是当前代码的功能说明。** 本文件是项目唯一有效的实施依据。PR #1 现存的 Python QUIC、B 本地端口转发至 A 内网等代码与目标不符，必须整体替换并重做测试后才允许合并。不得用“修补旧 Agent”来完成迁移，也不保留旧协议或旧配置兼容层。
 
-## 1. 目标与不可变的网络方向
+## 1. 唯一业务目标
 
-**B（境外 VPS）通过自己本机的 WARP SOCKS5 `UDP ASSOCIATE`，主动连接 A（境内 Windows）的 STUN 公网映射。**
+**让中国境内 A 的浏览器和应用通过境外 VPS B 访问互联网，解决 A 无法直接访问被 GFW 限制的境外资源的问题。**
 
-```text
-数据面（B 主动拨入 A）：
-B agent QUIC client
-  -> B localhost WARP SOCKS5 UDP :40000
-  -> Cloudflare/WARP UDP 出口
-  -> 电信 NAT1 公网 endpoint（由 A 同 socket STUN 得到）
-  -> A 家用光猫/路由器 UDP 39999 端口映射
-  -> A Windows agent UDP :39999（QUIC server）
+已知约束：B 公网 IP 可能被 GFW 阻断，A 无法稳定直连 B；但 B 本机 WARP SOCKS5 可通过 UDP 主动访问 A 经 STUN 发现的公网 NAT 映射。因此使用**B 主动建立隧道，A 借用 B 的互联网出口**的反向模型。
 
-控制面（低频、独立于数据面）：
-A agent -> A 本机 v2rayN SOCKS5 :10810
-        -> VLESS / Cloudflare CDN
-        -> B HTTP /control/mapping :18080
-```
+必须始终区分两种方向：
 
-不租 C 节点，不要求 B 有可直接访问的公网 UDP 或 TCP 业务入口。B 的公网 IP 可能被 GFW 封锁，但这不影响以上已分离的连接方向。
+- **物理隧道建立方向**：`B → WARP SOCKS5 UDP → A 的公网 UDP endpoint`。B 是发起方，A 是接收方。
+- **用户上网请求方向**：`A 浏览器 → A 本地 SOCKS5 → 已建立的反向隧道 → B freedom → 目标互联网服务`。应答沿原路返回 A。
 
-历史探测已经验证 `B WARP SOCKS5 UDP -> A STUN 映射` 的双向 UDP 包 5/5 成功；这不等于 QUIC 新版已在真实跨境链路验证通过，也不代表不配置家用路由器端口映射就一定可打通。
+**这不是让 B 访问 A 的内网服务，也不是让 B 开一个公网端口供 A 主动连接。** 成功标准是 A 真实通过 B 出口访问外网，而非仅仅 STUN、UDP、mKCP 或 VLESS 握手成功。
 
-### A 侧地址与端口的区别
+### 完整业务路径
 
 ```text
-A 进程固定绑定：UDP 39999
-家用路由器固定转发：UDP 39999 -> A 内网 IP:39999
-电信上层 NAT1：A 经 STUN 获得公网 IP:PORT（可能不是 39999）
+                           中国 A / Windows
+   浏览器 / curl / 应用
+          |
+          | SOCKS5（使用目标域名，避免本地 DNS 泄漏）
+          v
+   A Xray SOCKS5 127.0.0.1:10808
+          |
+          | 路由到本机 VLESS reverse-out（反向出口）
+          v
+   A Xray VLESS/mKCP + TLS 入站（仅 127.0.0.1:40001）
+          ^
+          | UDP 双向本地转发（mytrn 只转发数据报，不解 mKCP/VLESS）
+          v
+   A mytrn UDP 入口 0.0.0.0:39999  <---- STUN（同一 UDP socket）
+          ^
+          | A 路由器 UDP 39999 -> A LAN IP:39999
+          | 电信上层 NAT1 公网 IP:PORT（由 STUN 实测）
+          |
+          | Cloudflare/WARP UDP 出口
+          |
+   B WARP 本地 SOCKS5 UDP 127.0.0.1:40000
+          ^
+          | SOCKS5 UDP ASSOCIATE / 经证实可承载 mKCP 数据报
+          |
+   B Xray VLESS/mKCP + TLS 出站（主动拨入 A）
+          |
+          | VLESS 原生 reverse-in 接收 A 的代理请求
+          v
+   B Xray freedom（B 发起目标 TCP 连接并解析目标域名）
+          |
+          v
+   Google / GitHub / 其他境外互联网服务
 ```
 
-例如此前 STUN 观察到 `119.98.144.218:55781`；它是一次历史观测值，不写死在实现中。B **仅使用最新的 STUN 公网 IP:PORT** 主动拨入 A。
+图中箭头在同一条已建立的数据通道内双向传输；**B 的 WARP 只负责“B → A”的隧道承载**。默认的网站出口是 B 的 `freedom`（即 VPS 正常网络），**不是默认让网站流量经 WARP SOCKS5 出口**；两者不能混淆。
 
-## 2. MVP 范围（确认）
+## 2. 已确认的环境、已有证据与待证明部分
 
-- **节点**：单 A、单 B；A 固定 Windows / Python 3.13、固定内网 IP、UDP 39999；B 为 Linux VPS。
-- **真实转发**：只支持配置允许的 **TCP 目标端口**，不是只有 PING/PONG。B 本机 `127.0.0.1:listen_port` 上的 TCP 流量进入 B 已主动建立的 QUIC 隧道，由 A 连接其白名单目标（可以是 A 本机或 A 内网另一台设备）。B 本机监听是本地应用入口，**不是 B 对公网暴露业务端口**。
-- **连通与恢复**：映射变化后目标为几分钟内恢复；断网、A/B agent 重启、B SOCKS5 UDP relay 断开后自动尝试重连。
-- **部署**：前台 Python 进程，不做 Windows 服务或 systemd；用户自行维护防火墙、光猫路由器永久映射。
-- **配置**：A/B 各自通过本机 Web UI 修改 JSON 配置，保存后需重启进程。只保存本地密钥与状态；示例配置可提交，真实配置、私钥不进 Git。
-- **不做**：TCP 全局透明代理、TUN、通用 SOCKS 服务、UDP 业务端口转发、多节点、自动公网穿透配置、应用热重载、旧协议兼容。
+### A（中国）
 
-## 3. 数据面实现（QUIC over WARP SOCKS5 UDP）
+- Windows，Python 3.13；内网 IP 固定；先前测试程序固定 UDP `39999`。
+- 家庭光猫/路由器长期保留 `UDP 39999 → A 内网 IP:39999` 的端口转发，防火墙由用户手动管理。
+- 家用路由器前还有电信上层 NAT。历史 STUN 测到过 `119.98.144.218:55781`，这里的 `55781` 是**运营商侧公网端口**，不能误写成 `39999`；历史值只作说明，运行时不得硬编码。
+- 已有 v2rayN `127.0.0.1:10810` 经 VLESS/Cloudflare CDN 能访问 B 的 HTTP 控制面。该通道只用于低频控制，不承载用户网页流量。
 
-### QUIC 会话
+### B（境外）
 
-1. B 接到经控制面登记的 A endpoint 和 A TLS 证书；使用证书固定验证 A 身份。
-2. B 经 `socks5://127.0.0.1:40000` 的 `UDP ASSOCIATE` 发送 QUIC Initial，**B 为 QUIC client，A 为 QUIC server**。
-3. QUIC/TLS 握手完成后，B 立即通过首条双向流（stream 0）发送绑定时间戳与随机 nonce 的 `data_psk` HMAC 会话证明。
-4. A 验证通过并返回 `OK`，B 才将状态转成 `DATA_ACTIVE`，允许建立业务流。认证失败直接终止会话，不提供降级、密钥回退或明文兼容。
-5. A 对未完成会话认证的 QUIC 连接设置短超时（当前 20 秒）；仅已完成应用层认证的健康会话拥有单会话保护，不允许未认证请求无限占据唯一槽位。
+- Linux VPS；公网 IP 可能被 GFW 封锁，但 B 自身可以直接访问互联网。
+- B 现有 WARP 是 `socks5://127.0.0.1:40000` **本地 SOCKS5 代理**，不是宿主机默认路由；不得假设安装 WARP 后所有 Xray UDP 都会自动经过 WARP。
+- 既有探测已验证 B 的 WARP SOCKS5 `UDP ASSOCIATE` 与 STUN 可用，并验证 `B → WARP UDP → A 的 NAT endpoint → B` 双向收发 `5/5`。
 
-### 指定 TCP 端口转发
+### 尚未证明，严禁写成“已支持”
+
+1. **Xray mKCP 出站 + `sockopt.dialerProxy` + WARP SOCKS5 UDP** 能否在选定 Xray-core 版本下保持正确的 UDP 数据报边界、双向收发及 SOCKS5 关联生命周期。Xray 有对应配置能力，但这个组合必须端到端实测。不能把 SOCKS5 对 UDP 的支持等同于 mKCP 组合已可用。
+2. **Xray VLESS 原生反向代理**按本文 A/B 角色部署后，能否使 A 的本地 SOCKS5 请求通过 B `freedom` 正常访问域名和 HTTPS。官方提供反向机制，但本项目组合尚未现场验证。
+3. mytrn 的 UDP 入口能否在 A 的单一 `39999` socket 上同时完成 STUN、mKCP 双向转发，并长期保持电信上层 NAT 的可达映射。
+4. 以上组件组合在真实中国电信 NAT1 ↔ 美国 VPS/WARP 路径上的可用性、恢复时间、吞吐、丢包、DNS 行为和稳定性。
+
+以上四项是实现前及实施中的**硬性验证门槛**，不能靠编造模拟数据或仅靠配置语法检查宣布通过。
+
+## 3. 架构边界：复用成熟核心，不重造网络协议
+
+### Xray-core 完整负责
+
+- A 的本地 SOCKS5 代理入站和代理请求解析；B 的目标域名解析与 `freedom` 出站。
+- VLESS 身份认证、**原生 reverse-in/reverse-out**、路由和多请求连接管理。
+- mKCP 的可靠传输、丢包重传、顺序控制、拥塞控制和传输参数。
+- mKCP 上的端到端 TLS 加密与证书验证；选定版本双方一致且 `allowInsecure` 必须为 `false`。
+- SOCKS5 UDP 链式拨号能被实测支持时，直接由 Xray 完成，不编写自己的 mKCP/KCP、SOCKS5 代理或 TCP-over-UDP 传输层。
+
+### mytrn 仅负责 Xray 无法直接覆盖的编排
+
+- **A 边界 UDP 入口**：独占 UDP `39999`；用**同一个 socket** 做 STUN，并把 mKCP 数据报双向转给本机 Xray。只识别 STUN 事务、维护 UDP 对端映射，不解析或重写 mKCP/VLESS 内容。
+- **动态 endpoint 注册**：A 获得公网 IP:PORT，通过已有 CF/VLESS 控制链向 B 低频上报；B 缓存和持久化 endpoint。
+- **Xray 配置生成与生命周期**：Web 配置、严格校验、启动/停止、故障重试、endpoint 变化触发 B 侧 Xray 配置更新和受控重启；不承诺 Xray 不支持的热更新能力。
+- **健康状态与验证**：分层显示 STUN、控制面、WARP UDP、Xray 反向隧道和 A 经 B 上网的可用性，记录恢复耗时；不拿“心跳在线”冒充“代理可用”。
+
+**严禁出现的自研内容**：Python QUIC Agent、手写 KCP、TCP stream 帧、TCP 重传/窗口、SOCKS5 CONNECT 解析、业务端口反向映射框架或自造代理协议。这些属于 Xray-core 的责任。
+
+## 4. 原生 VLESS 反向代理的角色配置
+
+需要使用**同一组选定版本 Xray-core**，固定版本和配置生成规范，不采用跨版本猜字段的方式。Xray 官方当前模型：
+
+| A：中国，被动接收 B | B：美国，主动连接 A |
+| --- | --- |
+| `socks` inbound：本地 `127.0.0.1:10808`，供 A 用户访问外网 | `vless` outbound：目标为 A 动态公网 IP:PORT，`method: mkcp` |
+| `vless` inbound：本机 `127.0.0.1:40001`，mKCP/TLS；供 B 的反向连接接入 | outbound 上配置 `reverse: {tag: "reverse-in"}`；自动建立反向通道 |
+| VLESS 入站用户配置 `reverse: {tag: "reverse-out"}` | `routing`: 把 `reverse-in` 收到的请求送到 B 的 `freedom` |
+| `routing`: 只把 A 本地 SOCKS5 的业务请求送往 `reverse-out` | `freedom`：从 B 访问外部网站；按域名策略在 B 侧 DNS 解析 |
+
+关键点：A 是 VLESS/mKCP **服务端**，B 是 VLESS/mKCP **拨号端**；但真正代理上网的源头是 **A 本地用户**。不得沿用旧计划里的“B 本地 TCP 端口 → A 内网目标服务”。
+
+- VLESS 和 mKCP 为上下层，不是两次独立拨号；**`TLS over mKCP` 是可用的 Xray 组合**。由 Xray 自行完成端到端加密、证书检查与 UUID 身份认证；禁止裸 VLESS 或以 WARP 代替端到端加密。
+- 独立生成强随机 UUID、TLS 密钥/证书；B 校验 A 证书（受信 CA 或事先固定的证书），证书变化不自动无条件信任。
+- **TLS 服务端身份与动态 IP 解耦**：B 的拨号目标 IP:PORT 随 STUN 更新，但配置的 TLS `serverName` 与被验证的 A 证书身份必须稳定，不能把每次变化的公网 IP 当作证书名称，也不能为绕过证书错误关闭验证。
+- A 的 SOCKS5 默认只监听 loopback。B `freedom` 不应放任来自无关入站的未知请求成为开放代理；为反向通道明确路由与出口策略，避免路由环路。
+- **用户 DNS 必须有明确方案**：A 应用优先发送域名到 SOCKS5（如 `socks5h`）；B 侧解析和连接目标。第一版验收包含 DNS 泄漏检测；A 自身 STUN/控制链解析属运行基础设施流量，与用户浏览请求区别对待。
+- 第一版先完成 **SOCKS5 TCP CONNECT + HTTPS** 的真实上网，不把不经过代理的应用 UDP/QUIC、TUN 或全局透明代理能力写成已完成。将来是否支持 SOCKS5 UDP / XUDP 必须另做验证。
+
+## 5. A 的单端口 UDP/STUN 边界设计
+
+必须让**真正面向电信 NAT 的端口**和**STUN 探测源端口**相同：
 
 ```text
-B 本机业务程序 -> B agent 127.0.0.1:listen_port
--> B 已建立的 QUIC stream -> WARP SOCKS5 UDP -> A UDP :39999
--> A 按 targets 白名单连接 target_host:target_port
--> 双向 TCP <-> QUIC stream 数据转发
+               电信 NAT 公网 IP:PORT
+                         |
+      家用路由器 UDP 39999 -> A UDP 39999
+                         |
+              mytrn UDP ingress（独占）
+                  /                  \
+       STUN request/response       mKCP 数据报
+            本地处理                    |
+                               127.0.0.1:40001
+                                 A Xray mKCP
 ```
 
-- B 的 `forwards[].id` 必须对应 A `targets` 中同名规则；A 不接受 B 自由指定任意目标地址/端口。
-- 每个业务 stream 仍需要 `data_psk` HMAC、时间戳、nonce 验证，拒绝重放；底层 QUIC 提供 TLS 加密、重传、流量控制、拥塞控制和多路复用。
-- OPEN/OK 控制头是行分隔 JSON/文本，**只限制换行符之前的头部长度**（1024 字节），同一帧中跟随的 TCP payload 必须完整透传。
-- 处理双向 TCP 半关闭；两方向均完成后立即回收应用层 stream，不等待 QUIC session 关闭。拒绝、异常、连接超时也必须进入最终回收路径。
-- 当前限制：最多 32 条并发业务 stream、单 stream 已发送未确认数据应用层缓冲限额；半关闭长期无响应时有超时保护。具体数值以源码为准。
+- A 端 **mytrn 持有唯一 `0.0.0.0:39999` UDP socket**，Xray mKCP inbound 仅绑定 `127.0.0.1:40001`；不得尝试让独立 STUN/Xray 进程都绑 39999，也不得拿另一个本地端口的 STUN 结果冒充 39999 的映射。
+- STUN 从该 socket 发起，响应须按消息结构、transaction ID 与预期 STUN 服务器来源校验后识别；剩余报文作为不透明 UDP payload 处理，不做内容猜测。
+- 对 B 的实际 WARP UDP 来源建立**临时、可过期的双向映射**：从外部来源收到的数据转给内部 Xray；Xray 的回复通过原 `39999` socket 发回对应的外部来源。保持 KCP 所见的本地代理 peer 地址稳定，避免不同来源互相串流；对端切换可重新建表/会话。
+- 保持 UDP 数据报边界，不拼接、不拆成 TCP 字节流、不改写 mKCP 帧；检查 Windows 多 socket、MTU、超时、映射表淘汰、异常输入与进程关闭后的资源释放。
+- STUN 只表明**对 STUN 服务器的观测映射**。电信上层是否 endpoint-independent mapping 不能仅凭“NAT1”标签断言；必须实际用 B 的 WARP 出口向该地址打包，确认同一映射可达。
+- A 的原有光猫/路由器 `39999 -> 39999` 规则保留不变，不要求再映射 `40001`。Xray 的 `40001` 不能对公网开放。
 
-## 4. 控制面与 endpoint 维护
+## 6. B 的 WARP UDP 承载：先证明，再落实现有内核接法
 
-### A
+**第一优先选项**：由 B Xray 的 VLESS/mKCP 出站使用 `streamSettings.sockopt.dialerProxy` 指向现有 SOCKS5 outbound（上游为 `127.0.0.1:40000`），使所有发往 A endpoint 的 mKCP UDP 经 WARP 代理，而不是 B 主机公网 IP 直发。
 
-1. 使用**同一个 UDP :39999 socket** 同时收发 STUN 和 QUIC，避免另一个 STUN socket 测到无关映射。
-2. 启动时发现 endpoint，通过 v2rayN SOCKS5 → VLESS/CF 向 B 的 `POST /control/mapping` 上报 JSON（IP、端口、A 证书），HTTP 头 `X-Control-Token` 鉴权；不把 token 放入 GET URL。
-3. 周期性 STUN/keepalive（建议 15 秒），检测 IP 或公网端口变化；连续两次发现相同的新 endpoint 后才确认变化、通知 B。
-4. endpoint 变动时，A 主动结束旧 QUIC 会话以允许 B 重拨新映射。相同 endpoint 不重复触发重连。
-5. 正常连接时不高频 HTTP poll；保留 30 分钟低频登记和数据面长时间静默后的再登记，以处理 B 重启/状态丢失。
-6. 网络错误自动重试，失败原因可从状态接口/日志定位。
+这是**待集成验证的选项，不是已经确认的事实**。Xray 不同版本/传输方式的 `dialerProxy` 行为可能不同；测试必须包含 SOCKS5 UDP ASSOCIATE、UDP 数据报边界、mKCP/TLS 完整握手、双向网页流量，以及抓包/日志证明确实经 WARP 出口。
 
-### B
+**决策门槛**：
 
-1. HTTP 控制监听地址/端口可配置（默认仅本机 `127.0.0.1:18080`，与现有 VLESS/CF 配合）。
-2. 保存最新 endpoint 和经控制面验证的 A 证书/指纹；A 证书更换必须由管理员重新确认信任，不能悄然切换。
-3. 控制面更新**同一个** endpoint 不断开有效 QUIC；只有真正变化才通知连接循环更换目标。
-4. WARP SOCKS5 UDP relay 关闭、QUIC 心跳失效或 endpoint 更新后自动重建连接。
-5. Web UI 只能在 **QUIC/TLS + data_psk 会话认证** 全部成功后显示 `DATA_ACTIVE`。
+1. 使用固定的 Xray-core 版本在本机模拟 SOCKS5 UDP 和真实 B WARP SOCKS5 分别验证上述组合。
+2. 若 Xray 原生 SOCKS5 链式拨号的 mKCP UDP 路径实测正常，**不增加自研 B UDP 中转**。
+3. 若原生路径被证实不兼容，仅评估增加一个**只承载不透明 UDP 数据报的 B 本地 SOCKS5 UDP 适配器**：Xray mKCP 发往本地适配端口，适配器负责 SOCKS5 `UDP ASSOCIATE`、数据报封装/解封装和对端地址；**仍由 Xray 负责一切代理、VLESS/mKCP 和可靠性**。适配器必须有自己的集成测试和必要性证据后才能纳入实现。
+4. 若两种不改变核心责任划分的方式均不可行，则此项标记为技术阻塞，回到架构决策；**不能偷偷让 B 直连被封 IP，也不能改成 A 主动拨 B、换 Python QUIC 或引入第三台 VPS 来“让测试通过”。**
 
-## 5. 配置、密钥和运行方式
+## 7. 低频控制面与动态 endpoint 生命周期
 
-从根目录运行：
+控制面继续复用 **A v2rayN → VLESS/Cloudflare CDN → B** 的既有可用链路，和 B 的 WARP 数据面严格隔离。控制面失败不应阻塞当前健康的已建立数据连接。
 
 ```text
-python -m pip install -r requirements.txt
-python -m mytrn init a          # A 上创建随机控制/数据/管理密钥
-python -m mytrn init b          # B 上创建独立配置
-python -m mytrn a               # A 前台运行
-python -m mytrn b               # B 前台运行
+A 启动/断线恢复：同 UDP :39999 进行 STUN
+    -> 获得 public_ip:public_port
+    -> HTTP POST JSON /control/mapping（通过 A 的 v2rayN SOCKS5）
+    -> B 验证 token、版本、节点 ID/时间戳等
+    -> 持久化最新有效 endpoint
+    -> endpoint 真正变化时渲染 B Xray 配置并受控重启拨号进程
+    -> B 经 WARP SOCKS5 UDP 主动重新连接 A
 ```
 
-把 A 的 `control_token`、`data_psk` 配到 B；B 的 `admin_token` 独立。Web UI：A `127.0.0.1:18881`，B `127.0.0.1:18882`；配置 JSON 保存重启生效。真实配置 `config.a.json`、`config.b.json`、证书私钥、状态目录在 `.gitignore` 中。
+- **只支持一个 A 和一个 B**；单节点身份与控制密钥独立于 Xray VLESS UUID/TLS 证书。HTTP 控制 API 仅供该节点使用；强随机 token 放 HTTP header，配置与日志不泄漏秘密。
+- 启动时注册；定期 STUN 检测（初始建议 15–30 秒，连续两次确认变化）；只在 endpoint 变化时触发立即更新。必要时低频 refresh 确保 B 状态可恢复，正常不进行几秒一次的 HTTP 轮询。
+- B **只有在 endpoint 实际变化时**重新生成 Xray 客户端目标并受控重启相关实例；相同 endpoint 的 refresh 不应打断已建立的代理连接。不得假定 Xray 能无中断热改 mKCP 目标。
+- B 持久化最近一次**经认证**的 endpoint，B 重启后可先使用它尝试拨号；失败后继续等待 A 的新注册。A 网络变化、STUN 暂时失败、控制链断线时保留最后已知状态但标记可能过期，不把单次失败当成映射变更。
+- 关键路径故障重试应有退避和日志；**目标是 endpoint 变化后几分钟内恢复实际 A→外网访问**，实际指标以端到端探测测量，不以“配置已更新”计时结束。
+- 控制面与本机 Web UI 不向公网默认开放。若现有 CDN/VLESS 后端只能经特定 B 地址访问控制端口，应明确最小暴露范围并验证防火墙，而不是为方便一律绑定 `0.0.0.0`。
 
-配置要求：
+## 8. 进程部署与 Web 管理
 
-- **严格校验**：不接受未识别、缺失的配置字段或未知的转发规则字段；删除 `allow_private_endpoint` 等仅为测试引入的开关。
-- `control_bind`、`control_port`、`web_bind`、`web_port` 等均按明确角色配置。Web UI 默认回环地址，不公开部署。
-- A `targets`、B `forwards` 一一按规则 ID 配对；业务监听默认 B 回环地址。不要在无防火墙与鉴权防护下暴露 B Web UI、控制 API 或业务端口到公网。
+### 实例边界
 
-参见 [`README.md`](README.md) 和 `config.*.example.json`。
+- 原有 A 的 v2rayN 和 B 的 CF/VLESS 既有节点负责**控制链**，不能为了部署 mytrn 去覆盖或破坏它们的配置。
+- B 现有 WARP SOCKS5 服务保持独立，其代理地址可配置。
+- A/B 的 mytrn 分别管理**自己的专用 Xray-core 实例**，避免覆盖既有 Xray 节点端口、配置或重启其服务；Xray 可执行文件路径、配置目录、日志目录和启动参数明确设置。
+- Windows/Linux 均以当前前台 CLI 开始运行；暂不做系统服务、守护进程安装、自动更改 Windows 防火墙或路由器规则。
 
-## 6. 验证门槛
+### Web UI（两端都需要）
 
-### 已知历史验证（旧探测器）
+- 默认只监听 `127.0.0.1`，管理权限需要随机 token 或等价本地鉴权；远程使用 SSH 端口转发等安全方式。用户配置入口是 Web UI，不要求日常编辑底层 Xray JSON。
+- **A 页面**：本机 SOCKS5 端口、UDP `39999`、内部 Xray 端口、STUN、控制链代理与地址、TLS 身份、当前 NAT endpoint、注册/反向通道/代理状态。
+- **B 页面**：WARP SOCKS5 地址、控制监听、对应的 Xray 实例、当前 A endpoint、Xray reverse/freedom 状态与重拨信息。
+- 用**角色化、严格校验的 mytrn 配置模型**渲染两端 Xray JSON；不要让普通用户输入相互矛盾的 Xray 原始选项。预览配置、语法验证、原子保存、失败不覆盖可用配置；用户确认应用后显式受控重启 mytrn 管理的 Xray 进程。
+- 运行状态至少拆为：`STUN_OK`、`CONTROL_REGISTERED`、`WARP_UDP_OK`、`XRAY_REVERSE_READY`、`PROXY_E2E_OK`。只能把通过真实 SOCKS5→外网测试的状态称为代理可用；不可仅凭进程存活或 QUIC/KCP 握手显示“已连通外网”。
+- 不提交真实配置、证书私钥、令牌、状态文件和日志到 Git；测试用参数与生产配置隔离，未知字段直接报错。不引入旧 Agent 配置的自动转换层。
 
-- A 的 CF/VLESS 控制连接通 B：通过。
-- A 的 STUN 映射观测：通过。
-- B 的 WARP SOCKS5 `UDP ASSOCIATE` 和经 WARP 的 STUN：通过。
-- B WARP UDP → A NAT 映射、A 直接应答 → B：5/5 通过。
+## 9. 安全与网络故障边界
 
-### MVP 自动化回归（离线真实 socket）
+- A 的公网 UDP 入口可被任意来源探测：Xray 入站必须进行 VLESS/TLS 身份校验；UDP 入口不应替代协议认证，且要限制无效流量的资源消耗。
+- WARP 加密范围不等于 A/B 两端的端到端安全；因此必须启用 Xray TLS（或经明确验证的内核等价安全机制，本版选用 TLS），禁止将 `allowInsecure` 设为 true 作为通过测试的手段。
+- A SOCKS5 只给本机使用；B `freedom` 应是反向业务专用出口且受路由约束，防止意外开放代理、内网探测和循环转发。
+- 目标域名尽可能由 B 解析，测试 DNS 泄漏；A 本机 STUN 和控制面自身必需的 DNS 解析不代表浏览器 DNS 泄漏。
+- mKCP over WARP 可能有更高开销及 MTU 限制，选定参数前要做丢包、长 RTT、最大报文尺寸和 HTTPS 大文件测试；不以“WARP 已提供重传”作为理由忽略 UDP 丢包。
+- 出错时能清楚区分：A 路由器映射、电信上层 NAT、STUN、CF/VLESS 控制链、B WARP SOCKS5 UDP、Xray mKCP/TLS、VLESS reverse、B `freedom`/DNS、A 本地 SOCKS5。任何一层验证失败都要定位该层，不能自动切换错误方向来掩盖故障。
 
-- A/B 经模拟 SOCKS5 UDP relay 和 STUN 建立加密 QUIC/TCP echo，验证实际数据转发。
-- **100 次连续短 TCP 连接**，双向完成后无 stream 残留。
-- **40 次目标拒绝连接后恢复服务**，资源不泄漏，新连接能成功。
-- 正确头部与大块 TCP payload 合并到达不应误判超长；超长头应拒绝。
-- `data_psk` 不一致时，QUIC 握手可能成功，但不能进入 `DATA_ACTIVE`，业务不可用。
-- 控制 token 错误、A 证书错误、错误配置键、A/B 启停与 B 状态恢复。
-- endpoint 真实变化、WARP UDP relay 中断后恢复和未认证会话短超时需要独立回归验证。
-- GitHub Actions 要求 Windows 与 Linux 的 Python 3.13 测试通过。
+## 10. 实施顺序与通过标准（架构门槛优先）
 
-### 尚需用户真实环境验证
+### 阶段 0 — 技术可行性实证（先做，不先造 Web 框架）
 
-- 国内电信 NAT1/家用光猫映射 ↔ 境外 B 的 WARP SOCKS5 QUIC 实测。
-- 长时间运行（6 小时和 24 小时），记录断线恢复时间、endpoint 变化、RTT、丢包、代理重建次数、内存/连接占用。
-- 实际 endpoint 变化后几分钟内恢复为目标，不在缺少实网观测时宣称达标。
+1. 锁定 Windows/Linux **同版本** Xray-core；验证 `xray run -test` 和官方 `reverse`、`mkcp`、`tls` 配置。
+2. 单独验证 Xray 的 **VLESS reverse**：在实验网络 B 主动接 A，A SOCKS5 `socks5h` 请求最终由 B `freedom` 出网；只测试正确的用户流向。
+3. 单独验证 B 的 **mKCP → WARP SOCKS5 UDP**：实际检查 `dialerProxy` 是否完整适配 UDP；不通过则按第 6 节先出证据再决策薄适配器。
+4. 单独验证 A 的 **UDP 39999 STUN + 不透明 mKCP 转发**：STUN 映射与真实 Xray 数据来自同一个对外端口，并确认 WARP 出口确实可访问该公网映射。
+5. **门槛：**四项均可复现，才进行完整应用/界面开发；无法验证不标记通过。
 
-## 7. 后续阶段（MVP 通过之后）
+### 阶段 1 — 正确的端到端可用 MVP
 
-1. 优化真实中美网络下 QUIC 参数与监控，补齐长稳和异常网络覆盖。
-2. 按需求决定是否加入指定 UDP 业务端口转发，而不是提前开发全局代理。
-3. 仅在明确需要时考虑服务化、Web 配置热更新、性能与安全加固；不扩展为多节点或复杂平台。
+- 完成 A UDP 入口、STUN 探测、控制面动态上报、B endpoint 更新和 Xray 生命周期编排；不重造任何业务代理协议。
+- 在真实 A 机器配置 `SOCKS5 127.0.0.1:10808`，验证：
+
+  ```bash
+  curl --proxy socks5h://127.0.0.1:10808 https://ifconfig.me
+  curl --proxy socks5h://127.0.0.1:10808 https://www.google.com/
+  curl --proxy socks5h://127.0.0.1:10808 https://github.com/
+  ```
+
+- **必须证实**这三个请求从 B 发出，外部站点看到的出口属于 B 的预期境外网络，且浏览器请求不会在 A 本地直接绕过代理。再做 DNS 和 HTTPS 大响应验证。
+
+### 阶段 2 — 自动恢复与 Web UI
+
+- A 公网 IP/端口变化后：由 STUN 发现、控制链上报、B 更新 Xray 目标并重拨，最终 A SOCKS5 恢复上网。
+- 验证 B WARP SOCKS5 relay 重启、B Xray 进程重启、A agent 重启、A 断网恢复、B 缓存旧 endpoint 的行为。
+- Web 配置生成、校验、保存、受控重启与状态分层展示；真实配置默认私有。
+- **恢复验收**：目标为映射变化后几分钟内恢复真实 HTTPS 请求，记录发现、上报、重拨和请求成功各阶段时间。
+
+### 阶段 3 — 长稳与发布
+
+- 至少 6 小时及 24 小时实网运行，记录成功率、重连次数、RTT、吞吐、内存、DNS 泄漏与异常恢复。
+- Windows/Linux CI 验证配置渲染、严格校验、STUN/UDP 入口和控制 API；可以用模拟 WARP SOCKS5 但**必须附加真实跨境链路的验收记录**，不得拿模拟测试代替。
+- 只有架构、测试、README、示例配置及真实行为一致，并且满足 A→B→外网目标，PR 才具备合并条件。
+
+## 11. 对现有 PR #1 的迁移要求
+
+- 本次仅**重写计划文件**；PR #1 当前 `mytrn/tunnel.py`、`mytrn/agent.py`、相关配置示例、README 和旧测试仍是**已经废弃的 QUIC/反向内网转发实现**，不得声称已经符合本计划。
+- 后续实施必须在**同一个 PR #1** 中移除或整体替换旧 QUIC 实现及其过时测试/文档，生成 Xray 配置和薄编排层；不是把 Xray 功能叠在旧 QUIC Agent 上。
+- 不更改已有可用的 CF/VLESS 控制链和 WARP SOCKS5 运行方式；不为通过测试引入第三方 C 服务器、新 VPN、强制 A 主动连被封 B 公网 IP，或用户未要求的全局透明代理。
+- **在旧代码被替换且真实端到端验收完成之前，PR #1 保持 OPEN、不得合并。**
+
+## 12. 参考依据
+
+- Xray 官方：[VLESS 反向代理示例](https://xtls.github.io/document/level-2/vless_reverse.html)；[VLESS 入站](https://xtls.github.io/config/inbounds/vless.html)；[VLESS 出站](https://xtls.github.io/config/outbounds/vless.html)。
+- Xray 官方：[mKCP](https://xtls.github.io/config/transports/mkcp.html)；[传输与 TLS 组合](https://xtls.github.io/config/transport.html)；[Sockopt `dialerProxy`](https://xtls.github.io/config/transports/sockopt.html)。
+- Xray 源码：[mKCP 拨号器](https://github.com/XTLS/Xray-core/blob/main/transport/internet/kcp/dialer.go)；[底层拨号器](https://github.com/XTLS/Xray-core/blob/main/transport/internet/dialer.go)。
+- [Xray-core issue #6046](https://github.com/XTLS/Xray-core/issues/6046)：说明 mKCP 与 `dialerProxy` 存在版本和实现相关问题；因此本计划把 B→WARP UDP 的组合列为**需实测**，不根据源码推断上线成功。
