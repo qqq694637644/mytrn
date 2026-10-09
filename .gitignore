@@ -10,3 +10,5 @@ state.a/
 state.b/
 *.pem
 .env
+poc/xray26327/_private/
+.xray-ci/

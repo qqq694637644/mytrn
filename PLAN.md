@@ -69,14 +69,15 @@
 - B 现有 WARP 是 `socks5://127.0.0.1:40000` **本地 SOCKS5 代理**，不是宿主机默认路由；不得假设安装 WARP 后所有 Xray UDP 都会自动经过 WARP。
 - 既有探测已验证 B 的 WARP SOCKS5 `UDP ASSOCIATE` 与 STUN 可用，并验证 `B → WARP UDP → A 的 NAT endpoint → B` 双向收发 `5/5`。
 
-### 尚未证明，严禁写成“已支持”
+### 已验证的最小架构与仍未完成的实网验证
 
-1. **Xray mKCP 出站 + `sockopt.dialerProxy` + WARP SOCKS5 UDP** 能否在选定 Xray-core 版本下保持正确的 UDP 数据报边界、双向收发及 SOCKS5 关联生命周期。Xray 有对应配置能力，但这个组合必须端到端实测。不能把 SOCKS5 对 UDP 的支持等同于 mKCP 组合已可用。
-2. **Xray VLESS 原生反向代理**按本文 A/B 角色部署后，能否使 A 的本地 SOCKS5 请求通过 B `freedom` 正常访问域名和 HTTPS。官方提供反向机制，但本项目组合尚未现场验证。
-3. mytrn 的 UDP 入口能否在 A 的单一 `39999` socket 上同时完成 STUN、mKCP 双向转发，并长期保持电信上层 NAT 的可达映射。
-4. 以上组件组合在真实中国电信 NAT1 ↔ 美国 VPS/WARP 路径上的可用性、恢复时间、吞吐、丢包、DNS 行为和稳定性。
+以下实证以用户指定的 **Xray-core v26.3.27（提交 `d2758a0`）** 为准，测试代码见 [`poc/xray26327/`](poc/xray26327/)：
 
-以上四项是实现前及实施中的**硬性验证门槛**，不能靠编造模拟数据或仅靠配置语法检查宣布通过。
+1. **本机真实 Xray 验证已通过**：B VLESS/mKCP/TLS 出站的 `sockopt.dialerProxy` 使用 Xray SOCKS5 UDP outbound，通过 Python **mock SOCKS5 UDP ASSOCIATE** 双向传输 mKCP 数据报；A/B 都运行真实 Xray 26.3.27 可执行文件，A 本地 SOCKS5 请求经 VLESS 原生反向代理到 B `freedom`，成功获取 HTTP 响应。它证明原生路径在模拟 UDP 代理下可用，**不是**在真实 Cloudflare WARP 已验证。
+2. **本机 STUN/UDP 入口验证已通过**：A 由一个 Python UDP socket 进行 STUN 绑定与不透明 UDP 数据报往返，内部 Xray 监听另一回环 UDP 端口。此证明没有覆盖电信 NAT/家庭路由器的映射行为。
+3. **仍未验证**：B 现有 `127.0.0.1:40000` **真实 WARP SOCKS5 UDP** 与选定 Xray mKCP 在跨境长 RTT/丢包下的完整业务流、relay 生命周期；A 的实际电信上层 NAT 映射能否持续接收 B 经 WARP 发来的 mKCP 数据报；A 通过 B 真实访问 HTTPS 网站、DNS 泄漏、自动恢复和稳定性。
+
+三者严格区分；不能把本机 mock 或仅仅 `xray run -test` 成功冒充**真实跨境网络可用**。只有第 3 项得到可复现的现场日志之后，才能宣称完成阶段 0 全部门槛并开始 Go 正式编排。
 
 ## 3. 架构边界：复用成熟核心，不重造网络协议
 
@@ -112,6 +113,7 @@
 
 - VLESS 和 mKCP 为上下层，不是两次独立拨号；**`TLS over mKCP` 是可用的 Xray 组合**。由 Xray 自行完成端到端加密、证书检查与 UUID 身份认证；禁止裸 VLESS 或以 WARP 代替端到端加密。
 - 独立生成强随机 UUID、TLS 密钥/证书；B 校验 A 证书（受信 CA 或事先固定的证书），证书变化不自动无条件信任。
+- **v26.3.27 Windows 特性**：该版本的 `transport/internet/tls/config_windows.go` 在默认设置下不会把自定义自签 CA 放入根证书池。本 PoC 的 B TLS 配置明确使用 `disableSystemRoot: true` 并加载 A 的自签 CA，仍保持 `allowInsecure: false`；本机真实 Xray 已证实此设置可完成 TLS 握手。不允许为了绕过证书失败而关闭验证。
 - **TLS 服务端身份与动态 IP 解耦**：B 的拨号目标 IP:PORT 随 STUN 更新，但配置的 TLS `serverName` 与被验证的 A 证书身份必须稳定，不能把每次变化的公网 IP 当作证书名称，也不能为绕过证书错误关闭验证。
 - A 的 SOCKS5 默认只监听 loopback。B `freedom` 不应放任来自无关入站的未知请求成为开放代理；为反向通道明确路由与出口策略，避免路由环路。
 - **用户 DNS 必须有明确方案**：A 应用优先发送域名到 SOCKS5（如 `socks5h`）；B 侧解析和连接目标。第一版验收包含 DNS 泄漏检测；A 自身 STUN/控制链解析属运行基础设施流量，与用户浏览请求区别对待。
@@ -145,7 +147,7 @@
 
 **第一优先选项**：由 B Xray 的 VLESS/mKCP 出站使用 `streamSettings.sockopt.dialerProxy` 指向现有 SOCKS5 outbound（上游为 `127.0.0.1:40000`），使所有发往 A endpoint 的 mKCP UDP 经 WARP 代理，而不是 B 主机公网 IP 直发。
 
-这是**待集成验证的选项，不是已经确认的事实**。Xray 不同版本/传输方式的 `dialerProxy` 行为可能不同；测试必须包含 SOCKS5 UDP ASSOCIATE、UDP 数据报边界、mKCP/TLS 完整握手、双向网页流量，以及抓包/日志证明确实经 WARP 出口。
+**Xray 26.3.27 的本机集成已验证此选项可行**：A/B 真实 Xray 通过模拟 SOCKS5 UDP relay 完成 mKCP/TLS/VLESS reverse 及 A SOCKS5 → B freedom HTTP 请求。但与真实 B WARP 的组合仍为独立门槛；需用真实 WARP 出口来源、业务响应和重连日志确认，不可只凭模拟结果宣称 WARP 实网通过。
 
 **决策门槛**：
 
