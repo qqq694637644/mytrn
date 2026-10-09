@@ -353,6 +353,8 @@ async def actual_integration(tmp_path, xray_bin):
         stun.mapped_port = new_endpoint
         await wait_until(lambda: a.endpoint == ("127.0.0.1", new_endpoint) and
                          b.control.registration["port"] == new_endpoint and
+                         b.xray.proc is not None and
+                         b.xray.proc.returncode is None and
                          b.xray.proc.pid != previous_pid, timeout=25)
         await asyncio.sleep(2)
         assert await check_browser()
