@@ -44,5 +44,5 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "MYTRN_XRAY_BIN=$binary"
       - name: Compile Python source
         run: python -m compileall -q mytrn tests poc/xray26327
-      - name: Legacy regressions and real Xray reverse/mKCP-over-SOCKS5 UDP PoC
+      - name: Python A/B agents, endpoint recovery and real Xray 26.3.27 integration
         run: python -m pytest -q

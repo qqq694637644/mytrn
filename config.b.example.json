@@ -1,18 +1,13 @@
 {
   "role": "b",
-  "control_token": "COPY_THE_ACTUAL_CONTROL_TOKEN_FROM_A",
-  "data_psk": "COPY_THE_ACTUAL_DATA_PSK_FROM_A",
-  "admin_token": "GENERATED_BY_PYTHON_MINUS_M_MYTRN_INIT_B",
+  "xray_bin": "/absolute/path/to/xray-linux-amd64",
   "web_bind": "127.0.0.1",
   "web_port": 18882,
+  "admin_token": "REPLACE_USING_PYTHON_M_MYTRN_INIT_B",
+  "control_token": "REPLACE_WITH_THE_CONTROL_TOKEN_FROM_A",
+  "vless_uuid": "REPLACE_WITH_THE_VLESS_UUID_FROM_A",
   "state_dir": "state.b",
   "control_bind": "127.0.0.1",
   "control_port": 18080,
-  "warp_socks5": "socks5://127.0.0.1:40000",
-  "ping_interval": 5,
-  "reconnect_interval": 5,
-  "max_failures": 3,
-  "forwards": [
-    {"id": "demo", "listen_host": "127.0.0.1", "listen_port": 18081}
-  ]
+  "warp_socks5": "socks5://127.0.0.1:40000"
 }

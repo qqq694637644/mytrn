@@ -1,6 +1,6 @@
 # mytrn — Xray-core 反向代理上网架构与实施计划
 
-> **状态：目标架构 / 待实现；不是当前代码的功能说明。** 本文件是项目唯一有效的实施依据。PR #1 现存的 Python QUIC、B 本地端口转发至 A 内网等代码与目标不符，必须整体替换并重做测试后才允许合并。不得用“修补旧 Agent”来完成迁移，也不保留旧协议或旧配置兼容层。
+> **状态：Python Agent 已在 PR #1 实现并通过本机真实 Xray 26.3.27 集成测试；新增自动编排尚需 A/B 跨境实网复核。** 本文件是项目唯一有效的实施依据。旧 Python QUIC/B→A 内网转发代码和测试已整体删除，不留兼容层；后续在 Python 真实环境验收后，仅将 mytrn 编排层迁移 Go，始终复用 Xray-core。
 
 ## 1. 唯一业务目标
 
@@ -89,7 +89,7 @@
 - mKCP 上的端到端 TLS 加密与证书验证；选定版本双方一致且 `allowInsecure` 必须为 `false`。
 - SOCKS5 UDP 链式拨号能被实测支持时，直接由 Xray 完成，不编写自己的 mKCP/KCP、SOCKS5 代理或 TCP-over-UDP 传输层。
 
-### mytrn 仅负责 Xray 无法直接覆盖的编排
+### mytrn 仅负责 Xray 无法直接覆盖的编排（Python 首版，后续 Go）
 
 - **A 边界 UDP 入口**：独占 UDP `39999`；用**同一个 socket** 做 STUN，并把 mKCP 数据报双向转给本机 Xray。只识别 STUN 事务、维护 UDP 对端映射，不解析或重写 mKCP/VLESS 内容。
 - **动态 endpoint 注册**：A 获得公网 IP:PORT，通过已有 CF/VLESS 控制链向 B 低频上报；B 缓存和持久化 endpoint。
@@ -214,9 +214,11 @@ A 启动/断线恢复：同 UDP :39999 进行 STUN
 4. 单独验证 A 的 **UDP 39999 STUN + 不透明 mKCP 转发**：STUN 映射与真实 Xray 数据来自同一个对外端口，并确认 WARP 出口确实可访问该公网映射。
 5. **门槛：**四项均可复现，才进行完整应用/界面开发；无法验证不标记通过。
 
-### 阶段 1 — 正确的端到端可用 MVP
+### 阶段 1 — Python Agent：自动注册与真实代理上网
 
-- 完成 A UDP 入口、STUN 探测、控制面动态上报、B endpoint 更新和 Xray 生命周期编排；不重造任何业务代理协议。
+- **已实现（Python）**：A UDP 同端口 STUN/不透明 mKCP 网关；A 经 SOCKS5/VLESS/CF 的 HTTP POST 低频注册；B 保存 endpoint/首次固定 A 证书；A/B 用严格配置生成 v26.3.27 Xray JSON 并独立监督子进程；A/B 本地 Web JSON 配置与状态，A 网页按钮可实测代理外网出口。
+- **已通过本机集成**：真实 Xray v26.3.27、模拟 WARP SOCKS5 UDP、模拟控制链 SOCKS5 TCP、STUN、A 本地 SOCKS5 经 B freedom 访问本地 HTTP、B Agent/子进程重启、NAT 映射变化和 STUN 间歇性超时。Windows UDP 错误处理也已覆盖。
+- **下一步必须在用户真实 A/B 部署这套完整 Python Agent**（不是仅 PoC），核验低频控制、配置、B 独立 Xray 自动重拨、HTTPS 网页数据从 B 出网。不重造任何业务代理协议。
 - 在真实 A 机器配置 `SOCKS5 127.0.0.1:10808`，验证：
 
   ```bash
@@ -227,25 +229,26 @@ A 启动/断线恢复：同 UDP :39999 进行 STUN
 
 - **必须证实**这三个请求从 B 发出，外部站点看到的出口属于 B 的预期境外网络，且浏览器请求不会在 A 本地直接绕过代理。再做 DNS 和 HTTPS 大响应验证。
 
-### 阶段 2 — 自动恢复与 Web UI
+### 阶段 2 — 真实网络恢复、长稳与 Python 版本验收
 
 - A 公网 IP/端口变化后：由 STUN 发现、控制链上报、B 更新 Xray 目标并重拨，最终 A SOCKS5 恢复上网。
 - 验证 B WARP SOCKS5 relay 重启、B Xray 进程重启、A agent 重启、A 断网恢复、B 缓存旧 endpoint 的行为。
-- Web 配置生成、校验、保存、受控重启与状态分层展示；真实配置默认私有。
+- Web 编辑、严格配置校验、保存/重启、状态和 A 主动外网探测已在 Python 中实现；后续以实网日志检验用户可用性，按实测修正必要的编排错误。
 - **恢复验收**：目标为映射变化后几分钟内恢复真实 HTTPS 请求，记录发现、上报、重拨和请求成功各阶段时间。
 
-### 阶段 3 — 长稳与发布
+### 阶段 3 — 长稳通过后迁移 Go
 
 - 至少 6 小时及 24 小时实网运行，记录成功率、重连次数、RTT、吞吐、内存、DNS 泄漏与异常恢复。
 - Windows/Linux CI 验证配置渲染、严格校验、STUN/UDP 入口和控制 API；可以用模拟 WARP SOCKS5 但**必须附加真实跨境链路的验收记录**，不得拿模拟测试代替。
+- Python 真实网络验收通过之后，**只用 Go 重写 UDP/STUN、控制面、Web UI、配置生成与 Xray 进程管理**；用相同证书/端口和端到端测试作行为等价验证，继续使用同版本 Xray-core。不得重造 VLESS/mKCP/TLS/代理协议。
 - 只有架构、测试、README、示例配置及真实行为一致，并且满足 A→B→外网目标，PR 才具备合并条件。
 
-## 11. 对现有 PR #1 的迁移要求
+## 11. PR #1 当前代码状态与迁移规则
 
-- 本次仅**重写计划文件**；PR #1 当前 `mytrn/tunnel.py`、`mytrn/agent.py`、相关配置示例、README 和旧测试仍是**已经废弃的 QUIC/反向内网转发实现**，不得声称已经符合本计划。
-- 后续实施必须在**同一个 PR #1** 中移除或整体替换旧 QUIC 实现及其过时测试/文档，生成 Xray 配置和薄编排层；不是把 Xray 功能叠在旧 QUIC Agent 上。
+- 同一 PR 已**删除**旧 `mytrn/tunnel.py`、`mytrn/network.py`、`mytrn/agent.py` 及其过时 QUIC 测试，改由 `mytrn/udp.py`、`control.py`、`xray.py`、`web.py`、`app.py` 构成薄 Python 编排层；已有 PoC 保留以复现内核方案。
+- README 和 A/B 配置示例同步更新为 Python + Xray 的 A→B→外网唯一方向；未为旧配置、旧协议引入兼容模式。
 - 不更改已有可用的 CF/VLESS 控制链和 WARP SOCKS5 运行方式；不为通过测试引入第三方 C 服务器、新 VPN、强制 A 主动连被封 B 公网 IP，或用户未要求的全局透明代理。
-- **在旧代码被替换且真实端到端验收完成之前，PR #1 保持 OPEN、不得合并。**
+- **用户真实 A/B 上的 Python 自动控制/恢复及长稳尚未验收，PR #1 保持 OPEN、不得合并。**
 
 ## 12. 参考依据
 
