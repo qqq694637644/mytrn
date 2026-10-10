@@ -15,13 +15,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from aiohttp import ClientSession
+from aiohttp import ClientSession, web
 
 from mytrn.app import Agent
 from mytrn.config import (A_CF_DEFAULTS, A_MKCP_DEFAULTS, TLS_NAME, control_cf_ready,
                           create_a_identity, defaults, load_json,
                           mkcp_settings, save_json, validate, validate_a_certificate)
-from mytrn.control import ControlServer, register_from_a
+from mytrn.control import ControlServer, check_control_route, register_from_a
 from mytrn.udp import STUN_MAGIC, UdpGateway, parse_stun
 from mytrn.xray import XrayProcess, make_a, make_b
 from poc.xray26327.demo import proxy_http_request
@@ -209,7 +209,8 @@ def test_a_managed_cf_vless_control_is_separate_from_mkcp_and_v2rayn(tmp_path):
 
     a.update({"control_cf_address": "cdn.example.test", "control_cf_port": 443,
               "control_cf_uuid": str(uuid.uuid4()), "control_cf_server_name": "edge.example.test",
-              "control_cf_ws_host": "ws.example.test", "control_cf_ws_path": "/secure-ws"})
+              "control_cf_xhttp_host": "edge.example.test",
+              "control_cf_xhttp_path": "/secure-xhttp"})
     validate(a, "a")
     config = make_a(a, cert, key)
     assert control_cf_ready(a)
@@ -224,11 +225,13 @@ def test_a_managed_cf_vless_control_is_separate_from_mkcp_and_v2rayn(tmp_path):
         "address": "cdn.example.test", "port": 443,
         "id": a["control_cf_uuid"], "encryption": "none"}
     stream = cf["streamSettings"]
-    assert stream["network"] == "ws" and stream["security"] == "tls"
+    assert stream["network"] == "xhttp" and stream["security"] == "tls"
     assert stream["tlsSettings"] == {
-        "serverName": "edge.example.test", "allowInsecure": False}
-    assert stream["wsSettings"] == {
-        "path": "/secure-ws", "headers": {"Host": "ws.example.test"}}
+        "serverName": "edge.example.test", "allowInsecure": False,
+        "fingerprint": "chrome", "alpn": ["h3"]}
+    assert stream["xhttpSettings"] == {
+        "path": "/secure-xhttp", "host": "edge.example.test", "mode": "packet-up"}
+    assert "wsSettings" not in stream
     assert config["inbounds"][2]["streamSettings"]["kcpSettings"] == {"mtu": 1200}
     text = json.dumps(config)
     assert "10810" not in text and "control_socks5" not in text
@@ -248,10 +251,23 @@ def test_a_existing_config_retires_v2rayn_control_without_changing_secrets(tmp_p
     for key in A_CF_DEFAULTS:
         del a[key]
     a["control_socks5"] = "socks5://127.0.0.1:10810"
+    a["control_cf_ws_host"] = "previous-saved-host.example.test"
+    a["control_cf_ws_path"] = "/previous-saved-path"
+    a["control_cf_address"] = "cdn.example.test"
+    a["control_cf_uuid"] = str(uuid.uuid4())
+    a["control_cf_server_name"] = "edge.example.test"
     validate(a, "a")
     assert "control_socks5" not in a
-    assert {key: a[key] for key in A_CF_DEFAULTS} == A_CF_DEFAULTS
+    assert "control_cf_ws_host" not in a and "control_cf_ws_path" not in a
+    assert a["control_cf_xhttp_host"] == "previous-saved-host.example.test"
+    assert a["control_cf_xhttp_path"] == "/previous-saved-path"
+    assert a["control_cf_xhttp_mode"] == "packet-up"
+    assert a["control_cf_fingerprint"] == "chrome" and a["control_cf_alpn"] == "h3"
+    for key in ("control_proxy_port", "control_cf_port", "control_cf_xhttp_mode",
+                "control_cf_fingerprint", "control_cf_alpn"):
+        assert a[key] == A_CF_DEFAULTS[key]
     assert a["vless_uuid"] == original_uuid and a["control_token"] == original_token
+    a = defaults("a")
     a["control_host"] = "127.0.0.1"
     with pytest.raises(ValueError, match="Configure A CF/VLESS"):
         asyncio.run(register_from_a(a, "119.98.144.218", 39999, "unused-cert"))
@@ -285,8 +301,8 @@ def test_a_cf_node_web_configuration_and_validation(tmp_path):
                 updated.update({"control_cf_address": "cf.edge.example.test",
                                 "control_cf_uuid": str(uuid.uuid4()),
                                 "control_cf_server_name": "edge.example.test",
-                                "control_cf_ws_host": "host.example.test",
-                                "control_cf_ws_path": "/ws-vless",
+                                "control_cf_xhttp_host": "host.example.test",
+                                "control_cf_xhttp_path": "/xhttp-vless",
                                 "control_host": "127.0.0.1"})
                 bad = dict(updated, control_cf_uuid="bad-uuid")
                 async with client.post(base + "/api/config", headers=headers, json=bad) as response:
@@ -295,17 +311,60 @@ def test_a_cf_node_web_configuration_and_validation(tmp_path):
                 async with client.post(base + "/api/config", headers=headers, json=updated) as response:
                     assert response.status == 200
                     result = await response.json()
-                    assert "请重启 agent" in result["message"]
+                    assert "重启 A Python Agent" in result["message"]
                 saved = load_json(path)
                 assert "control_socks5" not in saved
-                assert saved["control_cf_ws_path"] == "/ws-vless"
+                assert saved["control_cf_xhttp_path"] == "/xhttp-vless"
+                assert saved["control_cf_xhttp_mode"] == "packet-up"
+                assert saved["control_cf_fingerprint"] == "chrome"
+                assert saved["control_cf_alpn"] == "h3"
                 assert saved["control_cf_uuid"] == updated["control_cf_uuid"]
                 assert saved["vless_uuid"] == config["vless_uuid"]
                 assert saved["control_token"] == config["control_token"]
                 assert agent.restart_required
                 assert not agent.status()["control_configured"]  # waits for explicit Agent restart
+                # Detecting control connectivity must not silently probe the
+                # obsolete running Xray config before an Agent restart.
+                async with client.post(base + "/api/control/check", headers=headers, json={}) as response:
+                    assert response.status == 409
+                async with client.post(base + "/api/control/check", json={}) as response:
+                    assert response.status == 401
         finally:
             await agent.ui.close()
+
+    asyncio.run(scenario())
+
+
+def test_readonly_control_check_verifies_b_go_signature_without_registration():
+    async def scenario():
+        socks = await FakeSocks().start()
+        calls = []
+
+        async def check_handler(request):
+            calls.append(request.method)
+            return web.Response(status=405, text='{"error":"method not allowed"}\n',
+                                content_type="application/json")
+
+        application = web.Application()
+        application.router.add_get("/control/mapping", check_handler)
+        application.router.add_post("/control/mapping", check_handler)
+        runner = web.AppRunner(application)
+        await runner.setup()
+        port = free_port()
+        await web.TCPSite(runner, "127.0.0.1", port).start()
+        a = defaults("a")
+        a.update({"control_host": "127.0.0.1", "control_port": port,
+                  "control_proxy_port": socks.port,
+                  "control_cf_address": "127.0.0.1", "control_cf_uuid": str(uuid.uuid4()),
+                  "control_cf_server_name": "edge.example.test",
+                  "control_cf_xhttp_host": "edge.example.test"})
+        try:
+            result = await check_control_route(a)
+            assert result["ok"] is True
+            assert calls == ["GET"]  # no token, no mapping POST, no B restart
+        finally:
+            await runner.cleanup()
+            await socks.close()
 
     asyncio.run(scenario())
 
@@ -445,7 +504,7 @@ async def actual_integration(tmp_path, xray_bin):
     cfg_a, cfg_b = defaults("a"), defaults("b")
     cfg_b["control_token"] = cfg_a["control_token"]
     cfg_b["vless_uuid"] = cfg_a["vless_uuid"]
-    # Real v26.3.27 Xray simulates the EXISTING CF/VLESS/TLS+WebSocket node.
+    # Real v26.3.27 Xray simulates the EXISTING CF/VLESS/TLS+XHTTP h3 node.
     # It forwards the control HTTP request to the B Python test control
     # server, while A's data reverse/mKCP still goes over the mock WARP UDP.
     cf_uuid = str(uuid.uuid4())
@@ -458,10 +517,10 @@ async def actual_integration(tmp_path, xray_bin):
             "tag": "mock-cf-vless", "listen": "127.0.0.1", "port": cf_port,
             "protocol": "vless", "settings": {"decryption": "none", "clients": [{"id": cf_uuid}]},
             "streamSettings": {
-                "network": "ws", "security": "tls",
-                "wsSettings": {"path": "/mytrn-test", "headers": {"Host": TLS_NAME}},
+                "network": "xhttp", "security": "tls",
+                "xhttpSettings": {"path": "/mytrn-test", "host": TLS_NAME, "mode": "packet-up"},
                 "tlsSettings": {"certificates": [{"certificateFile": str(cf_cert),
-                                                  "keyFile": str(cf_key)}]},
+                                                  "keyFile": str(cf_key)}], "alpn": ["h3"]},
             },
         }],
         "outbounds": [{"tag": "egress", "protocol": "freedom", "settings": {}}],
@@ -512,7 +571,7 @@ async def actual_integration(tmp_path, xray_bin):
         "control_proxy_port": a_control_socks,
         "control_cf_address": "127.0.0.1", "control_cf_port": cf_port,
         "control_cf_uuid": cf_uuid, "control_cf_server_name": TLS_NAME,
-        "control_cf_ws_host": TLS_NAME, "control_cf_ws_path": "/mytrn-test",
+        "control_cf_xhttp_host": TLS_NAME, "control_cf_xhttp_path": "/mytrn-test",
         "control_host": "127.0.0.1", "control_port": control_port,
         "register_retry": 1, "register_refresh": 300,
     })
@@ -552,7 +611,7 @@ async def actual_integration(tmp_path, xray_bin):
         assert fake_socks.udp_requests > 0
         assert fake_socks.tcp_connects == 0  # WARP mock is never A's control proxy.
         assert a.status()["control_local_socks"] == f"127.0.0.1:{a_control_socks}"
-        assert a.status()["control_transport"] == "own-xray-vless-ws-tls-via-cf"
+        assert a.status()["control_transport"] == "own-xray-vless-xhttp-tls-via-cf"
         assert a.status()["control_configured"] is True
         assert cf_xray.status()["running"]
         assert b.control.registration["port"] == a_udp
@@ -572,6 +631,10 @@ async def actual_integration(tmp_path, xray_bin):
                 assert response.status == 400
             amended["control_port"] = cfg_b["control_port"]
             amended["web_bind"] = "127.0.0.1"
+            async with client.post(web_url + "/api/config", headers={"X-Admin-Token": cfg_b["admin_token"]}, json=amended) as response:
+                assert response.status == 200
+            assert not b.restart_required  # saving unchanged config is a no-op
+            amended["web_bind"] = "0.0.0.0"
             async with client.post(web_url + "/api/config", headers={"X-Admin-Token": cfg_b["admin_token"]}, json=amended) as response:
                 assert response.status == 200
             assert b.restart_required

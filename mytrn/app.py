@@ -172,7 +172,7 @@ class Agent:
             status.update({"stun_last_success": self.last_stun,
                            "stun_consecutive_failures": self.stun_failures,
                            "control_last_registration": self.last_registration,
-                           "control_transport": "own-xray-vless-ws-tls-via-cf",
+                           "control_transport": "own-xray-vless-xhttp-tls-via-cf",
                            "control_configured": control_cf_ready(self.config),
                            "control_local_socks": f"127.0.0.1:{self.config['control_proxy_port']}",
                            "gateway": self.gateway.status() if self.gateway else {},

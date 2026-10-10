@@ -33,7 +33,7 @@ def binary_path(value: str) -> str:
 def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
     # The same managed Xray process carries TWO strictly separated paths:
     # local user SOCKS5 -> native VLESS reverse/mKCP (B -> A transport), and
-    # Python's own control SOCKS5 -> CF CDN/VLESS over TLS+WebSocket.
+    # Python's own control SOCKS5 -> CF CDN/VLESS over XHTTP+TLS.
     # The UDP 39999/STUN gateway remains a separate Python socket; 40001 is
     # Xray's private mKCP UDP listener, not a second public NAT mapping.
     outbounds = [{"tag": "deny", "protocol": "blackhole"}]
@@ -45,11 +45,14 @@ def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
                          "port": c["control_cf_port"], "id": c["control_cf_uuid"],
                          "encryption": "none"},
             "streamSettings": {
-                "network": "ws", "security": "tls",
+                "network": "xhttp", "security": "tls",
                 "tlsSettings": {"serverName": c["control_cf_server_name"],
-                                "allowInsecure": False},
-                "wsSettings": {"path": c["control_cf_ws_path"],
-                               "headers": {"Host": c["control_cf_ws_host"]}},
+                                "allowInsecure": False,
+                                "fingerprint": c["control_cf_fingerprint"],
+                                "alpn": [c["control_cf_alpn"]]},
+                "xhttpSettings": {"path": c["control_cf_xhttp_path"],
+                                  "host": c["control_cf_xhttp_host"],
+                                  "mode": c["control_cf_xhttp_mode"]},
             },
         })
         control_outbound = "cf-control"

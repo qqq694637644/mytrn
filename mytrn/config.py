@@ -30,25 +30,31 @@ A_KEYS = {"udp_bind", "udp_port", "xray_udp_port", "socks_port", "stun_servers",
           "stun_interval", "stun_confirm", "register_refresh", "register_retry",
           "control_host", "control_port", "control_proxy_port",
           "control_cf_address", "control_cf_port", "control_cf_uuid",
-          "control_cf_server_name", "control_cf_ws_host", "control_cf_ws_path"}
+          "control_cf_server_name", "control_cf_xhttp_host", "control_cf_xhttp_path",
+          "control_cf_xhttp_mode", "control_cf_fingerprint", "control_cf_alpn"}
 B_KEYS = {"control_bind", "control_port", "warp_socks5"}
 
 # CF/VLESS is generated directly by Python in A's Xray. Missing node fields
 # leave the control route disabled, not redirected through v2rayN or DIRECT.
+# Actual working v2rayN node: XHTTP packet-up, TLS fingerprint chrome, ALPN h3.
+# XHTTP over h3 uses UDP 443; it is not WebSocket.
 A_CF_DEFAULTS = {
     "control_proxy_port": 10909,
     "control_cf_address": "",
     "control_cf_port": 443,
     "control_cf_uuid": "",
     "control_cf_server_name": "",
-    "control_cf_ws_host": "",
-    "control_cf_ws_path": "/",
+    "control_cf_xhttp_host": "",
+    "control_cf_xhttp_path": "/",
+    "control_cf_xhttp_mode": "packet-up",
+    "control_cf_fingerprint": "chrome",
+    "control_cf_alpn": "h3",
 }
 
 
 def control_cf_ready(c: dict) -> bool:
     return all(c[key] for key in ("control_cf_address", "control_cf_uuid",
-                                   "control_cf_server_name", "control_cf_ws_host"))
+                                   "control_cf_server_name", "control_cf_xhttp_host"))
 
 # A originally set MTU=1200 and used the other Xray 26.3.27 defaults.
 A_MKCP_DEFAULTS = {
@@ -159,6 +165,14 @@ def validate(c: dict, role: str):
         # discard the retired v2rayN control setting and preserve all A
         # identities, UDP settings and mKCP values.
         c.pop("control_socks5", None)
+        # The previous A UI incorrectly labelled XHTTP Host/Path as WS.
+        # This is a one-time rename of the saved values, not a WS fallback.
+        old_host = c.pop("control_cf_ws_host", None)
+        old_path = c.pop("control_cf_ws_path", None)
+        if "control_cf_xhttp_host" not in c and old_host is not None:
+            c["control_cf_xhttp_host"] = old_host
+        if "control_cf_xhttp_path" not in c and old_path is not None:
+            c["control_cf_xhttp_path"] = old_path
         for key, value in A_CF_DEFAULTS.items():
             c.setdefault(key, value)
         for key, value in A_MKCP_DEFAULTS.items():
@@ -204,15 +218,22 @@ def validate(c: dict, role: str):
         if not isinstance(c["control_host"], str) or not c["control_host"]:
             raise ValueError("control_host required")
         for key in ("control_cf_address", "control_cf_uuid", "control_cf_server_name",
-                    "control_cf_ws_host", "control_cf_ws_path"):
+                    "control_cf_xhttp_host", "control_cf_xhttp_path", "control_cf_xhttp_mode",
+                    "control_cf_fingerprint", "control_cf_alpn"):
             if not isinstance(c[key], str):
                 raise ValueError(f"{key} must be a string")
-        for key in ("control_cf_address", "control_cf_server_name", "control_cf_ws_host"):
+        for key in ("control_cf_address", "control_cf_server_name", "control_cf_xhttp_host"):
             if c[key] and (any(char.isspace() for char in c[key]) or
                            any(char in c[key] for char in "/@")):
                 raise ValueError(f"{key} must be a hostname or IP without URL/whitespace")
-        if not c["control_cf_ws_path"].startswith("/") or "#" in c["control_cf_ws_path"]:
-            raise ValueError("control_cf_ws_path must begin with / (no fragment)")
+        if not c["control_cf_xhttp_path"].startswith("/") or "#" in c["control_cf_xhttp_path"]:
+            raise ValueError("control_cf_xhttp_path must begin with / (no fragment)")
+        if c["control_cf_xhttp_mode"] not in ("packet-up", "stream-up", "stream-one"):
+            raise ValueError("control_cf_xhttp_mode must be packet-up, stream-up or stream-one")
+        if c["control_cf_fingerprint"] not in ("chrome", "firefox", "safari", "edge"):
+            raise ValueError("control_cf_fingerprint must be chrome, firefox, safari or edge")
+        if c["control_cf_alpn"] not in ("h3", "h2"):
+            raise ValueError("control_cf_alpn must be h3 or h2")
         if c["control_cf_uuid"]:
             try:
                 if str(uuid.UUID(c["control_cf_uuid"])) != c["control_cf_uuid"].lower():
@@ -220,8 +241,8 @@ def validate(c: dict, role: str):
             except (ValueError, TypeError, AttributeError) as exc:
                 raise ValueError("control_cf_uuid must be canonical VLESS UUID") from exc
         if any(c[key] for key in ("control_cf_address", "control_cf_uuid",
-                                 "control_cf_server_name", "control_cf_ws_host")) and not control_cf_ready(c):
-            raise ValueError("CF node is incomplete: address, UUID, SNI and WS Host are required")
+                                 "control_cf_server_name", "control_cf_xhttp_host")) and not control_cf_ready(c):
+            raise ValueError("CF node is incomplete: address, UUID, SNI and XHTTP Host are required")
         if not isinstance(c["stun_servers"], list) or not c["stun_servers"] or len(c["stun_servers"]) > 4:
             raise ValueError("stun_servers must contain 1..4 endpoints")
         for server in c["stun_servers"]:

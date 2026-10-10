@@ -28,8 +28,11 @@
   "control_cf_port": 443,
   "control_cf_uuid": "",
   "control_cf_server_name": "",
-  "control_cf_ws_host": "",
-  "control_cf_ws_path": "/",
+  "control_cf_xhttp_host": "",
+  "control_cf_xhttp_path": "/",
+  "control_cf_xhttp_mode": "packet-up",
+  "control_cf_fingerprint": "chrome",
+  "control_cf_alpn": "h3",
   "control_host": "CHANGE_TO_B_CONTROL_HOST",
   "control_port": 18080
 }

@@ -21,7 +21,7 @@ async def register_from_a(config: dict, ip: str, port: int, certificate: str) ->
     if config["control_host"].startswith("CHANGE_"):
         raise ValueError("Set A control_host in Web UI before registering")
     if not control_cf_ready(config):
-        raise ValueError("Configure A CF/VLESS address, UUID, TLS SNI and WS Host before registering")
+        raise ValueError("Configure A CF/VLESS address, UUID, TLS SNI and XHTTP Host before registering")
     # Python -> its own Xray loopback SOCKS5 -> CF CDN/VLESS -> B Go HTTP.
     # v2rayN is ONLY the user traffic collector: never use its 10810 port,
     # the MyTRN data SOCKS5 10808, or any direct connection to B as fallback.
@@ -38,6 +38,30 @@ async def register_from_a(config: dict, ip: str, port: int, certificate: str) ->
             if answer.get("ok") is not True:
                 raise OSError("control did not acknowledge mapping")
             return answer
+
+
+async def check_control_route(config: dict) -> dict:
+    """Read-only proof that A's own CF/VLESS route reaches B's Go HTTP API.
+
+    B's /control/mapping permits only POST. Its distinctive GET/405 reply
+    proves routing without registering or changing a NAT endpoint on B.
+    """
+    if config["control_host"].startswith("CHANGE_") or not control_cf_ready(config):
+        raise ValueError("请先保存完整的 CF XHTTP 节点及 B 控制 HTTP 地址并重启 A")
+    connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{config['control_proxy_port']}", rdns=True)
+    url = f"http://{config['control_host']}:{config['control_port']}/control/mapping"
+    async with ClientSession(connector=connector, timeout=ClientTimeout(total=18), trust_env=False) as session:
+        async with session.get(url, allow_redirects=False) as response:
+            if response.content_length is not None and response.content_length > 2048:
+                raise OSError("B 控制接口响应超过限制，可能没有到达预期 Go API")
+            body = await response.content.read(2049)
+            if len(body) > 2048:
+                raise OSError("B 控制接口响应超过限制")
+            # Match the x-ui Go control handler's distinctive response;
+            # an unrelated CDN/Caddy 405 page does NOT prove B was reached.
+            if response.status != 405 or b'{"error":"method not allowed"}' not in body.lower():
+                raise OSError(f"目标返回 HTTP {response.status}，未验证到 B x-ui Go 控制接口")
+    return {"ok": True, "message": "通过 A 自有 Xray 的 CF/XHTTP 通道到达 B Go 控制 API（GET 405 符合预期；未上报或修改映射）"}
 
 
 def validate_registration(value: dict) -> dict:

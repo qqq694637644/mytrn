@@ -5,10 +5,10 @@
 ```text
 建立隧道：B x-ui Xray → 现有 WARP SOCKS5 UDP :40000 → 电信 NAT 公网 IP:PORT → A Python UDP :39999 → A Xray UDP :40001
 用户上网：A 浏览器 → v2rayN（只负责本机流量收集）→ A Xray SOCKS5 :10808 → VLESS reverse/mKCP/TLS → B freedom → 网站
-控制面：A Python → 自己管理的 A Xray SOCKS5 :10909 → VLESS/TLS/WS → Cloudflare CDN → B 现有 VLESS :26417 → B x-ui Go HTTP :18080
+控制面：A Python → 自己管理的 A Xray SOCKS5 :10909 → VLESS/TLS/XHTTP (packet-up / chrome / h3) → Cloudflare CDN → B 现有 VLESS :26417 → B x-ui Go HTTP（使用实际监听端口）
 ```
 
-Xray-core v26.3.27 **原生负责** SOCKS5、CF CDN/VLESS/TLS/WebSocket 控制通道、VLESS reverse/mKCP/TLS 数据通道、重传和代理连接。A 的 Python 只负责 STUN/UDP 39999、低频 HTTP 注册、生成配置并管理自己的**一个** Xray 进程、本机 Web 配置。B 由**已实现的 x-ui Go + x-ui 唯一 Xray 进程**管理 endpoint、WARP 出站和境外 freedom。**没有自写 QUIC/KCP/TCP-over-UDP。**
+Xray-core v26.3.27 **原生负责** SOCKS5、CF CDN/VLESS/TLS/XHTTP 控制通道、VLESS reverse/mKCP/TLS 数据通道、重传和代理连接。A 的 Python 只负责 STUN/UDP 39999、低频 HTTP 注册、生成配置并管理自己的**一个** Xray 进程、本机 Web 配置。B 由**已实现的 x-ui Go + x-ui 唯一 Xray 进程**管理 endpoint、WARP 出站和境外 freedom。**没有自写 QUIC/KCP/TCP-over-UDP。**
 
 已在用户真实的电信 NAT1 + 美国 VPS WARP 上用独立 [Python PoC](poc/xray26327/README.md) 验证 B 连接 A 和 A 代理请求经 B `freedom` 到 `ifconfig.me:443`。**本正式 Python Agent 版本已通过本机真实 Xray + 模拟 SOCKS5 UDP/STUN/控制链的集成测试；自动恢复机制尚未在你的真实 A/B 环境完成验收。**
 
@@ -33,10 +33,12 @@ python -m mytrn a
 - 在 A 浏览器打开 `http://127.0.0.1:18881`，输入 `admin_token` 后读取配置。
 - 设置 `xray_bin` 为 A 本机 **v26.3.27** Xray 的绝对路径，如 `C:/Tools/Xray/xray.exe`。
 - 保留 `udp_bind=0.0.0.0`、`udp_port=39999`、`xray_udp_port=40001`、`socks_port=10808`。A 光猫/路由器的 `UDP 39999 → A 固定内网 IP:39999` 规则必须已经生效；**不要映射 40001**。
-- 在 A Web UI 的“**控制面：CF CDN / VLESS**”中，从**当前已可用的** CF/VLESS 节点填写：`control_cf_address`（CF 域名/IP）、`control_cf_port`（通常 443）、`control_cf_uuid`（**现有节点的 VLESS UUID，不是 MyTRN reverse UUID**）、`control_cf_server_name`（真实 TLS SNI）、`control_cf_ws_host`（真实 WebSocket Host）、`control_cf_ws_path`（实际 WS Path）。当前实现是 **VLESS + TLS + WebSocket**；如果你已有的 CF 节点不是 WS 传输，需要先提供真实节点传输参数，不要猜测或自行改 B 侧服务。
+- 在 A Web UI 的“**控制面：CF CDN / VLESS + XHTTP**”中，从**目前已经正常工作的 v2rayN 节点**填写：`control_cf_address`（CDN 地址）、`control_cf_port`、`control_cf_uuid`（该 VLESS 节点的 UUID，非 MyTRN UUID）、`control_cf_server_name`（TLS SNI）、`control_cf_xhttp_host`（XHTTP Host）、`control_cf_xhttp_path`（XHTTP Path）、`control_cf_xhttp_mode`（截图为 `packet-up`）、`control_cf_fingerprint`（截图为 `chrome`）、`control_cf_alpn`（截图为 `h3`）。**先前 A 使用 WS，与你实际能用的 XHTTP 节点不符，是控制请求失败的关键原因。**
 - `control_host` / `control_port` 是通过上述 CF/VLESS 出站实际访问的 **B x-ui Go HTTP 控制服务 IP:PORT**（通常端口 18080），不是 CF 域名。确认 B VLESS 代理能访问该 HTTP 地址；不要默认认为远端 loopback 一定可达。
 - `control_proxy_port` 默认 `10909`，是**Python 专用、本机回环的 Xray SOCKS5 入站**；用户数据 `10808` 只由 v2rayN 使用。A 的 Python **不再依赖 v2rayN `10810` 做控制**。旧 `control_socks5` 字段读取时删除并由新 CF 配置项取代；没有填写 CF 节点时控制注册明确失败，不直连 B、不回退 v2rayN，mKCP 数据入口仍可以启动。
 - 点击保存，然后**退出并重新执行 `python -m mytrn a`**。重启后 A 会用同一个 `39999` UDP socket 做 STUN 并在变化时注册 B。
+- **检测 CF → B 控制链路（只读）**：在重启 A 后点击网页的检测按钮，Python 用 A Xray 本地 `10909` SOCKS5 经 XHTTP 访问 B Go `/control/mapping` 的 GET 接口。只有收到 B Go 特有的 HTTP `405` JSON 才算控制 HTTP 路径可达；**不会执行注册、改变 STUN endpoint 或触发 B 重启**。如果仍看到 `[WinError 64]`，查看 `state.a/xray-a.log`，依次核对 XHTTP、HTTP/3 UDP 443、TLS 指纹、ALPN、SNI/Host/Path，以及 B Go 当前控制端口（以 x-ui 实际值为准）。
+- 旧 A 配置中的 `control_cf_ws_host`、`control_cf_ws_path` 在首次读取/保存时分别改名为 `control_cf_xhttp_host`、`control_cf_xhttp_path`，保留你已经填写的值；运行时**没有 WebSocket 兜底或 v2rayN 控制通道**。原配置的 admin_token、control_token、VLESS UUID、A TLS 证书和 mKCP 端口不变。
 
 #### A/B 双端 mKCP 调参（保留现有 Python A + x-ui B）
 
@@ -62,7 +64,7 @@ python -m mytrn a
 - B 的 HTTP 控制接口必须能通过 A 的 CF/VLESS 出站到达；A 注册报文仍是原有 `POST /control/mapping`，包含 A STUN 公网 IP:PORT 和 A 的 TLS 公钥证书。B Go 校验 token、固定证书指纹，公网映射变化时按既定方式重启同一个 Xray。
 - B 数据面复用**现有 WARP SOCKS5 UDP `127.0.0.1:40000`**，并主动连接 A 的公网 STUN endpoint；用户网站流量从 B 现有 `freedom` 出站，不经过 WARP 出站网站。
 
-推荐顺序：**先在 B x-ui 配好 MyTRN，并确认原有 VLESS/CF 服务可用；再在 A Web UI 填写现有 CF 节点的 TLS/WS 参数及 B HTTP 地址；最后重启 A Python Agent**。不改动 v2rayN 已有的用户代理分流到 A `10808` 的规则。
+推荐顺序：**先在 B x-ui 配好 MyTRN，并确认原有 VLESS/CF 服务可用；再在 A Web UI 填写现有 CF 节点的 TLS/XHTTP 参数及 B HTTP 地址；最后重启 A Python Agent**。不改动 v2rayN 已有的用户代理分流到 A `10808` 的规则。
 
 ## Web UI 与验证
 
@@ -71,7 +73,7 @@ python -m mytrn a
 | Web UI | `127.0.0.1:18881` | 既有 x-ui 面板的入站列表 MyTRN 行 |
 | 进程 | `python -m mytrn a` + A 自有 Xray | x-ui Go + x-ui 原有单 Xray |
 | 浏览器代理 | `127.0.0.1:10808`（SOCKS5） | 无需对公网监听 |
-| 控制面代理 | `127.0.0.1:10909`（Python 专用，Xray VLESS/TLS/WS 经 CF） | 普通 Go HTTP 控制服务（如 `:18080`） |
+| 控制面代理 | `127.0.0.1:10909`（Python 专用，Xray VLESS/TLS/XHTTP (packet-up / chrome / h3) 经 CF） | 普通 Go HTTP 控制服务（如 `:18080`） |
 | UDP 端口 | `39999`，光猫转发 | B 通过 WARP SOCKS5 UDP 主动连接 A |
 | Xray 配置 | `state.a/xray-a.json` | x-ui 原有统一 `bin/config.json` |
 | 管理 Web 状态 | STUN 映射、CF 控制注册、Xray、外网出口测试 | MyTRN endpoint、信任证书及配置应用状态 |
@@ -116,6 +118,6 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
-设置 `MYTRN_XRAY_BIN` 为真实 Xray 26.3.27 可执行文件时，增加本机完整运行自动化测试：**真实的 A Xray CF/VLESS/TLS/WS 控制出站** → 本机真实 Xray 模拟既有 CF VLESS 服务 → 测试用 B HTTP 控制 API；数据面使用模拟 WARP SOCKS5 UDP/STUN、真实 VLESS reverse/mKCP/TLS、实际本地 HTTP 代理请求、B 测试 Xray 重启和 NAT endpoint 变化恢复。**此集成测试的 B 是独立 Python 测试服务，不等同于你真实 VPS 上 x-ui Go 的部署验收。**
+设置 `MYTRN_XRAY_BIN` 为真实 Xray 26.3.27 可执行文件时，增加本机完整运行自动化测试：**真实的 A Xray CF/VLESS/TLS/XHTTP (packet-up / chrome / h3) 控制出站** → 本机真实 Xray 模拟既有 CF VLESS 服务 → 测试用 B HTTP 控制 API；数据面使用模拟 WARP SOCKS5 UDP/STUN、真实 VLESS reverse/mKCP/TLS、实际本地 HTTP 代理请求、B 测试 Xray 重启和 NAT endpoint 变化恢复。**此集成测试的 B 是独立 Python 测试服务，不等同于你真实 VPS 上 x-ui Go 的部署验收。**
 
 原来的自写 Python QUIC/TCP 转发代码已整体删除；[`poc/xray26327/`](poc/xray26327/) 留作可复现的架构验证材料。A 保留 Python，B 使用已有的 x-ui Go 集成；不增加 A Go 迁移或旧控制 SOCKS5 兼容通道。
