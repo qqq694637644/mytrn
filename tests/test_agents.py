@@ -16,7 +16,8 @@ import pytest
 from aiohttp import ClientSession
 
 from mytrn.app import Agent
-from mytrn.config import create_a_identity, defaults, load_json, save_json, validate, validate_a_certificate
+from mytrn.config import (A_MKCP_DEFAULTS, create_a_identity, defaults, load_json,
+                          mkcp_settings, save_json, validate, validate_a_certificate)
 from mytrn.control import ControlServer
 from mytrn.udp import STUN_MAGIC, UdpGateway, parse_stun
 from mytrn.xray import make_a, make_b
@@ -187,6 +188,95 @@ def test_strict_config_and_certificates(tmp_path):
     assert outbound["streamSettings"]["sockopt"]["dialerProxy"] == "warp-socks5"
     assert outbound["streamSettings"]["tlsSettings"]["allowInsecure"] is False
     assert wanted["outbounds"][2]["protocol"] == "freedom"
+
+
+def test_a_mkcp_defaults_migration_and_generated_xray_settings(tmp_path):
+    a = defaults("a")
+    # Original A config.a.json never had mKCP fields. It must keep the
+    # same effective Xray behaviour and its existing identity and ports.
+    original_uuid = a["vless_uuid"]
+    original_token = a["control_token"]
+    for key in A_MKCP_DEFAULTS:
+        del a[key]
+    validate(a, "a")
+    assert {key: a[key] for key in A_MKCP_DEFAULTS} == A_MKCP_DEFAULTS
+    assert a["vless_uuid"] == original_uuid and a["control_token"] == original_token
+    assert a["udp_port"] == 39999
+    assert mkcp_settings(a) == {"mtu": 1200}
+
+    identity, private_key, _, _ = create_a_identity(tmp_path)
+    initial = make_a(a, identity, private_key)
+    assert initial["inbounds"][1]["streamSettings"]["kcpSettings"] == {"mtu": 1200}
+
+    a.update({"mkcp_mtu": 1100, "mkcp_tti": 25, "mkcp_uplink_capacity": 10,
+              "mkcp_downlink_capacity": 40, "mkcp_congestion": True,
+              "mkcp_read_buffer_size": 4, "mkcp_write_buffer_size": 8})
+    validate(a, "a")
+    tuned = make_a(a, identity, private_key)["inbounds"][1]["streamSettings"]["kcpSettings"]
+    assert tuned == {"mtu": 1100, "tti": 25, "uplinkCapacity": 10,
+                     "downlinkCapacity": 40, "congestion": True,
+                     "readBufferSize": 4, "writeBufferSize": 8}
+
+
+@pytest.mark.parametrize("key,value", [
+    ("mkcp_mtu", 575), ("mkcp_mtu", 1461),
+    ("mkcp_tti", 9), ("mkcp_tti", 1001),
+    ("mkcp_uplink_capacity", 0), ("mkcp_downlink_capacity", 1001),
+    ("mkcp_read_buffer_size", 0), ("mkcp_write_buffer_size", 257),
+    ("mkcp_congestion", 1), ("mkcp_mtu", True),
+])
+def test_a_mkcp_strict_bounds(key, value):
+    a = defaults("a")
+    a[key] = value
+    with pytest.raises(ValueError, match="mkcp_"):
+        validate(a, "a")
+
+
+def test_a_mkcp_web_save_applies_without_restart_python_gateway(tmp_path):
+    async def scenario():
+        a = defaults("a")
+        a["web_port"] = free_port()
+        a["state_dir"] = str(tmp_path / "state")
+        for key in A_MKCP_DEFAULTS:
+            del a[key]  # Simulate an existing real-world A installation.
+        path = tmp_path / "config.a.json"
+        save_json(path, a)
+        agent = Agent("a", path)
+        await agent.ui.start()  # Only the Web listener, never the UDP gateway.
+        headers = {"X-Admin-Token": a["admin_token"]}
+        base = f"http://127.0.0.1:{a['web_port']}"
+        try:
+            async with ClientSession() as client:
+                async with client.get(base + "/api/config", headers=headers) as response:
+                    assert response.status == 200
+                    current = await response.json()
+                assert current["mkcp_mtu"] == 1200 and current["mkcp_tti"] == 50
+                current["mkcp_tti"] = 25
+                current["mkcp_write_buffer_size"] = 8
+                async with client.post(base + "/api/config", json=current, headers=headers) as response:
+                    assert response.status == 200
+                    result = await response.json()
+                    assert "无需重启" in result["message"]
+                assert agent.config["mkcp_tti"] == 25
+                assert not agent.restart_required
+                assert load_json(path)["mkcp_write_buffer_size"] == 8
+                # Reject bad tunings without changing the saved or live state.
+                invalid = dict(current, mkcp_tti=1001)
+                async with client.post(base + "/api/config", json=invalid, headers=headers) as response:
+                    assert response.status == 400
+                assert agent.config["mkcp_tti"] == 25
+                assert load_json(path)["mkcp_tti"] == 25
+                # Unrelated config changes preserve the original manual
+                # Python Agent restart workflow.
+                changed_other = dict(current, register_refresh=1200)
+                async with client.post(base + "/api/config", json=changed_other, headers=headers) as response:
+                    assert response.status == 200
+                assert agent.restart_required
+                assert agent.config["register_refresh"] == 1800
+        finally:
+            await agent.ui.close()
+
+    asyncio.run(scenario())
 
 
 def test_stun_binding_and_bad_packets():

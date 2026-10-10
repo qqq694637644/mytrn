@@ -36,6 +36,23 @@ python -m mytrn a
 - 设置 `control_host` 为既有 v2rayN/CF/VLESS **能到达 B 控制 API 的地址**，不是浏览器上网代理地址；`control_socks5` 默认 `socks5://127.0.0.1:10810`，控制端口默认 `18080`。
 - 点击保存，然后**退出并重新执行 `python -m mytrn a`**。重启后 A 会用同一个 `39999` UDP socket 做 STUN 并在变化时注册 B。
 
+#### A/B 双端 mKCP 调参（保留现有 Python A + x-ui B）
+
+- A Web UI `http://127.0.0.1:18881` 新增“**A 端 mKCP 传输参数**”表单，直接显示当前值并可独立保存：MTU、TTI、上行容量、下行容量、拥塞控制、读取缓冲、写入缓冲；也可在原有 JSON 编辑器中修改对应 `mkcp_*` 字段。
+- **只改变 A 的 mKCP 参数时**，保存后当前 Python Agent 会在约 3 秒内对新的 Xray 26.3.27 配置执行 `run -test`，通过后仅重启 A 的**专用 Xray 子进程**。UDP Gateway/STUN `39999`、Web、控制上报及 NAT 映射不重建。普通配置（如端口/控制路径）变更仍需重启 Python Agent。
+- B 的 mKCP 参数独立在 **x-ui → 入站列表 → MyTRN → 编辑** 中修改，使用 x-ui 的单 Xray 进程重启机制；不再需要运行独立 B Python Agent。
+- 新字段兼容旧 `config.a.json`：没有 `mkcp_*` 键时自动显示**之前实际生效的默认值**，**不会改变**原有 token、UUID、STUN/控制路径或 A 的 UDP 端口。
+
+| 参数 | A/B 当前有效默认值 | 说明 |
+| --- | --- | --- |
+| MTU | `1200` 字节 | A 当前 Python Xray 和 B 已验证配置；考虑 WARP UDP、NAT 路径的包头额外开销 |
+| TTI | `50` 毫秒 | Xray 26.3.27 默认；过大可能增加时延，且当前内核存在窗口计算分母限制，UI 最大 1000 |
+| uplinkCapacity / downlinkCapacity | `5 / 20` MB/s | **协议容量参数，不是测速结果或实际限速**；上下行在 A/B 各自设置 |
+| congestion | `false` | 改变窗口控制行为，建议单独比较 |
+| readBufferSize / writeBufferSize | `2 / 2` MB | `writeBufferSize` 影响发送缓冲；该核心版本的 `readBufferSize` 虽可配置，当前读取窗口并未使用其值 |
+
+当前 Xray 26.3.27 **不支持**旧 mKCP `header`、`seed`，因此不暴露。建议先记录当前成功的基线，再每次只改一个值；调整期间 A/B 数据面会短暂重连，但控制链路仍走原有 CF/VLESS。可在 A 端用 `curl.exe --proxy socks5h://127.0.0.1:10808 https://ifconfig.me` 检查真实业务流量是否恢复。
+
 ### 初始化并配置 B（Linux VPS）
 
 ```bash
@@ -63,7 +80,7 @@ python3 -m mytrn b
 | 专用 Xray 配置 | `state.a/xray-a.json` | `state.b/xray-b.json` |
 | 管理 Web 状态 | STUN 映射、控制注册、Xray、外网出口测试 | 最新 A endpoint、证书指纹、Xray 状态 |
 
-修改配置通过 Web JSON 编辑器完成；字段严格校验，**不提供旧 QUIC Agent 兼容字段或自动升级**。保存后需重启 Agent 才会生效；mytrn 会先用 `xray run -test` 校验生成的内核配置，再启动自己的子进程。
+修改配置仍可使用 Web JSON 编辑器，**A 的 mKCP 另提供专用调参表单**；字段严格校验，不提供旧 QUIC Agent 兼容字段。仅修改 A mKCP 时自动重启 A Xray 生效，其他配置仍需重启 Agent；mytrn 会先用 `xray run -test` 校验新内核配置再启动子进程。
 
 ### 最重要的真实验收
 

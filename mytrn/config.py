@@ -31,6 +31,34 @@ A_KEYS = {"udp_bind", "udp_port", "xray_udp_port", "socks_port", "stun_servers",
           "control_socks5", "control_host", "control_port"}
 B_KEYS = {"control_bind", "control_port", "warp_socks5"}
 
+# A originally set MTU=1200 and used the other Xray 26.3.27 defaults.
+A_MKCP_DEFAULTS = {
+    "mkcp_mtu": 1200,
+    "mkcp_tti": 50,
+    "mkcp_uplink_capacity": 5,
+    "mkcp_downlink_capacity": 20,
+    "mkcp_congestion": False,
+    "mkcp_read_buffer_size": 2,
+    "mkcp_write_buffer_size": 2,
+}
+
+
+def mkcp_settings(config: dict) -> dict:
+    """Only emit supported Xray v26.3.27 knobs, preserving the old default JSON."""
+    result = {"mtu": config.get("mkcp_mtu", 1200)}
+    for key, output in (
+        ("mkcp_tti", "tti"),
+        ("mkcp_uplink_capacity", "uplinkCapacity"),
+        ("mkcp_downlink_capacity", "downlinkCapacity"),
+        ("mkcp_read_buffer_size", "readBufferSize"),
+        ("mkcp_write_buffer_size", "writeBufferSize"),
+    ):
+        if config.get(key, A_MKCP_DEFAULTS[key]) != A_MKCP_DEFAULTS[key]:
+            result[output] = config[key]
+    if config.get("mkcp_congestion", False):
+        result["congestion"] = True
+    return result
+
 
 def defaults(role: str) -> dict:
     if role not in ("a", "b"):
@@ -55,6 +83,7 @@ def defaults(role: str) -> dict:
             "control_socks5": "socks5://127.0.0.1:10810",
             "control_host": "CHANGE_TO_B_CONTROL_HOST", "control_port": 18080,
         })
+        c.update(A_MKCP_DEFAULTS)
     else:
         c.update({"control_bind": "127.0.0.1", "control_port": 18080,
                   "warp_socks5": "socks5://127.0.0.1:40000"})
@@ -106,7 +135,12 @@ def socks_uri(raw, key):
 def validate(c: dict, role: str):
     if role not in ("a", "b") or not isinstance(c, dict):
         raise ValueError("invalid role/config")
-    exact_keys(c, COMMON | (A_KEYS if role == "a" else B_KEYS), role)
+    if role == "a":
+        # Existing config.a.json files predate the mKCP knobs. Preserve all
+        # existing fields and fill only the former effective Xray defaults.
+        for key, value in A_MKCP_DEFAULTS.items():
+            c.setdefault(key, value)
+    exact_keys(c, COMMON | (A_KEYS | A_MKCP_DEFAULTS.keys() if role == "a" else B_KEYS), role)
     if c["role"] != role:
         raise ValueError("config role mismatch")
     for key in ("admin_token", "control_token"):
@@ -123,6 +157,19 @@ def validate(c: dict, role: str):
             raise ValueError(f"{key} required")
     port(c["web_port"], "web_port")
     if role == "a":
+        kcp_ranges = {
+            "mkcp_mtu": (576, 1460),
+            "mkcp_tti": (10, 1000),
+            "mkcp_uplink_capacity": (1, 1000),
+            "mkcp_downlink_capacity": (1, 1000),
+            "mkcp_read_buffer_size": (1, 256),
+            "mkcp_write_buffer_size": (1, 256),
+        }
+        for key, (minimum, maximum) in kcp_ranges.items():
+            if type(c[key]) is not int or not minimum <= c[key] <= maximum:
+                raise ValueError(f"{key} must be integer {minimum}..{maximum}")
+        if type(c["mkcp_congestion"]) is not bool:
+            raise ValueError("mkcp_congestion must be boolean")
         for key in ("udp_port", "xray_udp_port", "socks_port", "control_port"):
             port(c[key], key)
         if len({c["udp_port"], c["xray_udp_port"], c["socks_port"], c["web_port"]}) != 4:

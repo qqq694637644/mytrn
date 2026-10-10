@@ -10,7 +10,7 @@ import time
 from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp_socks import ProxyConnector
 
-from .config import load_json, save_json, validate
+from .config import A_MKCP_DEFAULTS, load_json, save_json, validate
 
 LOG = logging.getLogger("mytrn.web")
 HTML = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -21,26 +21,58 @@ main{background:white;border:1px solid #dde5ef;border-radius:14px;padding:24px}
 textarea{width:100%;box-sizing:border-box;min-height:420px;font:13px/1.5 Consolas,monospace;padding:12px;border:1px solid #ccd6e3;border-radius:8px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:#f0f4f8;border-radius:8px;font:13px/1.5 Consolas,monospace}
 input{font:inherit;padding:9px;max-width:100%;width:350px;border:1px solid #bdc9d6;border-radius:6px}
+input[type=number]{width:145px;box-sizing:border-box}
+input[type=checkbox]{width:auto}
 button{padding:9px 14px;margin:8px 8px 8px 0;background:#1f507a;color:white;border:0;border-radius:7px;cursor:pointer}
+.mkcp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:14px 20px;margin:14px 0}
+.mkcp-grid label{display:flex;flex-direction:column;gap:4px}
+.mkcp-grid label.checkbox{flex-direction:row;align-items:center}
 small{color:#566478}h1{margin-bottom:0}
 </style></head><body><main><h1>mytrn</h1><small>A 本地 SOCKS5 → Xray reverse/mKCP → B 境外互联网</small>
 <p>Web 管理 token（来自 <code>python -m mytrn init</code>，保存在当前浏览器）：</p>
 <input id="token" type="password" autocomplete="off"><button id="refresh">读取状态与配置</button>
 <button id="probe">从 A 验证外网出口</button>
 <h3>运行状态</h3><pre id="status">请输入 token 并读取</pre>
-<h3>配置（JSON）</h3><p><small>只编辑 mytrn 参数，不直接编辑 Xray 内核 JSON。保存成功后重启 agent 生效；B 必须使用与 A 相同的 control_token 和 vless_uuid。</small></p>
+<section id="mkcp-panel" hidden>
+<h3>A 端 mKCP 传输参数</h3>
+<p><small>当前 A Xray 入站默认 MTU=1200，其余使用 Xray 26.3.27 默认值。调参只重启 A 的 Xray 子进程，STUN/UDP 39999 网关不断开；B 在 x-ui 的 MyTRN 设置中单独调整。B/A 的 MTU 请保持兼容。</small></p>
+<div class="mkcp-grid">
+<label>MTU（字节）<input id="mkcp_mtu" type="number" min="576" max="1460" step="1"></label>
+<label>TTI（毫秒）<input id="mkcp_tti" type="number" min="10" max="1000" step="1"></label>
+<label>上行容量（MB/s）<input id="mkcp_uplink_capacity" type="number" min="1" max="1000" step="1"></label>
+<label>下行容量（MB/s）<input id="mkcp_downlink_capacity" type="number" min="1" max="1000" step="1"></label>
+<label>读缓冲（MB）<input id="mkcp_read_buffer_size" type="number" min="1" max="256" step="1"></label>
+<label>写缓冲（MB）<input id="mkcp_write_buffer_size" type="number" min="1" max="256" step="1"></label>
+<label class="checkbox"><input id="mkcp_congestion" type="checkbox">启用拥塞控制</label>
+</div>
+<button id="mkcp-save">保存并应用 A 的 mKCP</button><button id="mkcp-reset">恢复原有参数</button>
+<p><small>readBufferSize 在当前 Xray 版本中虽支持配置，但实际读取窗口没有使用该值。header、seed 已被移除，不提供这些无效选项。</small></p>
+</section>
+<h3>配置（JSON）</h3><p><small>只编辑 mytrn 参数，不直接编辑 Xray 内核 JSON。仅修改 A 的 mKCP 参数时自动应用，其他配置保存后仍需重启 Python Agent；B 必须使用相同的 control_token 和 vless_uuid。</small></p>
 <textarea id="config" spellcheck="false"></textarea><button id="save">校验并保存</button>
 <pre id="message"></pre>
 </main><script>
 const $=(id)=>document.getElementById(id);$('token').value=localStorage.getItem('mytrn.admin')||'';
+const mkcpKeys=['mkcp_mtu','mkcp_tti','mkcp_uplink_capacity','mkcp_downlink_capacity','mkcp_read_buffer_size','mkcp_write_buffer_size','mkcp_congestion'];
+const mkcpDefaults={mkcp_mtu:1200,mkcp_tti:50,mkcp_uplink_capacity:5,mkcp_downlink_capacity:20,mkcp_read_buffer_size:2,mkcp_write_buffer_size:2,mkcp_congestion:false};
+function showMkcp(config){$('mkcp-panel').hidden=config.role!=='a';if(config.role!=='a')return;
+for(const key of mkcpKeys){const value=config[key]===undefined?mkcpDefaults[key]:config[key];
+if(key==='mkcp_congestion')$(key).checked=value;else $(key).value=value;}}
+function getMkcp(){const values={};for(const key of mkcpKeys){if(key==='mkcp_congestion'){values[key]=$(key).checked;continue;}
+const raw=$(key).value;if(!/^\d+$/.test(raw))throw Error(key+' 必须是整数');values[key]=Number(raw);}return values;}
 async function api(path,method='GET',value){localStorage.setItem('mytrn.admin',$('token').value);
 const opts={method,headers:{'X-Admin-Token':$('token').value,'Content-Type':'application/json'}};
 if(value!==undefined)opts.body=JSON.stringify(value);
 const resp=await fetch(path,opts),result=await resp.json();if(!resp.ok)throw Error(result.error||String(resp.status));return result;}
 $('refresh').onclick=async()=>{try{$('status').textContent=JSON.stringify(await api('/api/status'),null,2);
-$('config').value=JSON.stringify(await api('/api/config'),null,2);$('message').textContent='读取成功';}catch(e){$('message').textContent=e.message;}};
+$('config').value=JSON.stringify(await api('/api/config'),null,2);showMkcp(JSON.parse($('config').value));$('message').textContent='读取成功';}catch(e){$('message').textContent=e.message;}};
 $('save').onclick=async()=>{try{const obj=JSON.parse($('config').value);
-$('message').textContent=(await api('/api/config','POST',obj)).message;}catch(e){$('message').textContent=e.message;}};
+$('message').textContent=(await api('/api/config','POST',obj)).message;showMkcp(obj);}catch(e){$('message').textContent=e.message;}};
+$('mkcp-save').onclick=async()=>{try{const config=await api('/api/config');
+if(config.role!=='a')throw Error('mKCP 表单仅用于 A Python');Object.assign(config,getMkcp());
+const result=await api('/api/config','POST',config);$('config').value=JSON.stringify(config,null,2);
+$('message').textContent=result.message;showMkcp(config);}catch(e){$('message').textContent=e.message;}};
+$('mkcp-reset').onclick=()=>showMkcp({role:'a',...mkcpDefaults});
 $('probe').onclick=async()=>{try{$('message').textContent='正在通过 A SOCKS5 检测...';
 $('message').textContent=JSON.stringify(await api('/api/probe','POST',{}),null,2);}catch(e){$('message').textContent=e.message;}};
 </script></body></html>"""
@@ -67,7 +99,9 @@ class WebUI:
     async def config(self, request):
         if not self.authorized(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return web.json_response(load_json(self.agent.path), headers={"Cache-Control": "no-store"})
+        config = load_json(self.agent.path)
+        validate(config, self.agent.role)
+        return web.json_response(config, headers={"Cache-Control": "no-store"})
 
     async def save(self, request):
         if not self.authorized(request):
@@ -75,7 +109,17 @@ class WebUI:
         try:
             new_config = await request.json()
             validate(new_config, self.agent.role)
+            changed = {key for key in new_config if new_config[key] != self.agent.config.get(key)}
             save_json(self.agent.path, new_config)
+            if self.agent.role == "a" and changed <= A_MKCP_DEFAULTS.keys():
+                # The 3-second Xray supervisor sees the new desired config,
+                # validates it, and restarts only its own child Xray. Keep
+                # Python STUN, UDP 39999, control and Web UI continuously up.
+                self.agent.config = new_config
+                if changed:
+                    self.agent.proxy_probe = None
+                return web.json_response({"ok": True, "message":
+                    "mKCP 已保存，A 的 Xray 将自动校验并应用（通常约 3 秒）；Python/UDP 39999 无需重启。"})
             self.agent.restart_required = True
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             return web.json_response({"error": str(exc)}, status=400)

@@ -16,7 +16,7 @@ from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .config import TLS_NAME, XRAY_VERSION, save_json
+from .config import TLS_NAME, XRAY_VERSION, mkcp_settings, save_json
 
 LOG = logging.getLogger("mytrn.xray")
 
@@ -41,7 +41,7 @@ def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
                  {"id": c["vless_uuid"], "reverse": {"tag": "reverse-out"}},
              ]},
              "streamSettings": {"network": "kcp", "security": "tls",
-                                "kcpSettings": {"mtu": 1200},
+                                "kcpSettings": mkcp_settings(c),
                                 "tlsSettings": {"certificates": [
                                     {"certificateFile": str(certfile.resolve()),
                                      "keyFile": str(keyfile.resolve())},
