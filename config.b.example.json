@@ -1,0 +1,13 @@
+{
+  "role": "b",
+  "xray_bin": "/absolute/path/to/xray-linux-amd64",
+  "web_bind": "127.0.0.1",
+  "web_port": 18882,
+  "admin_token": "REPLACE_USING_PYTHON_M_MYTRN_INIT_B",
+  "control_token": "REPLACE_WITH_THE_CONTROL_TOKEN_FROM_A",
+  "vless_uuid": "REPLACE_WITH_THE_VLESS_UUID_FROM_A",
+  "state_dir": "state.b",
+  "control_bind": "127.0.0.1",
+  "control_port": 18080,
+  "warp_socks5": "socks5://127.0.0.1:40000"
+}

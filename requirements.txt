@@ -1,0 +1,3 @@
+aiohttp>=3.11,<4
+aiohttp-socks>=0.10,<1
+cryptography>=44,<51
