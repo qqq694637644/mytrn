@@ -28,8 +28,27 @@ COMMON = {"role", "xray_bin", "web_bind", "web_port", "admin_token",
           "control_token", "vless_uuid", "state_dir"}
 A_KEYS = {"udp_bind", "udp_port", "xray_udp_port", "socks_port", "stun_servers",
           "stun_interval", "stun_confirm", "register_refresh", "register_retry",
-          "control_socks5", "control_host", "control_port"}
+          "control_host", "control_port", "control_proxy_port",
+          "control_cf_address", "control_cf_port", "control_cf_uuid",
+          "control_cf_server_name", "control_cf_ws_host", "control_cf_ws_path"}
 B_KEYS = {"control_bind", "control_port", "warp_socks5"}
+
+# CF/VLESS is generated directly by Python in A's Xray. Missing node fields
+# leave the control route disabled, not redirected through v2rayN or DIRECT.
+A_CF_DEFAULTS = {
+    "control_proxy_port": 10909,
+    "control_cf_address": "",
+    "control_cf_port": 443,
+    "control_cf_uuid": "",
+    "control_cf_server_name": "",
+    "control_cf_ws_host": "",
+    "control_cf_ws_path": "/",
+}
+
+
+def control_cf_ready(c: dict) -> bool:
+    return all(c[key] for key in ("control_cf_address", "control_cf_uuid",
+                                   "control_cf_server_name", "control_cf_ws_host"))
 
 # A originally set MTU=1200 and used the other Xray 26.3.27 defaults.
 A_MKCP_DEFAULTS = {
@@ -80,9 +99,9 @@ def defaults(role: str) -> dict:
             "stun_servers": ["stun.cloudflare.com:3478"],
             "stun_interval": 20, "stun_confirm": 2,
             "register_refresh": 1800, "register_retry": 15,
-            "control_socks5": "socks5://127.0.0.1:10810",
             "control_host": "CHANGE_TO_B_CONTROL_HOST", "control_port": 18080,
         })
+        c.update(A_CF_DEFAULTS)
         c.update(A_MKCP_DEFAULTS)
     else:
         c.update({"control_bind": "127.0.0.1", "control_port": 18080,
@@ -136,8 +155,12 @@ def validate(c: dict, role: str):
     if role not in ("a", "b") or not isinstance(c, dict):
         raise ValueError("invalid role/config")
     if role == "a":
-        # Existing config.a.json files predate the mKCP knobs. Preserve all
-        # existing fields and fill only the former effective Xray defaults.
+        # One-time configuration schema update, not a protocol fallback:
+        # discard the retired v2rayN control setting and preserve all A
+        # identities, UDP settings and mKCP values.
+        c.pop("control_socks5", None)
+        for key, value in A_CF_DEFAULTS.items():
+            c.setdefault(key, value)
         for key, value in A_MKCP_DEFAULTS.items():
             c.setdefault(key, value)
     exact_keys(c, COMMON | (A_KEYS | A_MKCP_DEFAULTS.keys() if role == "a" else B_KEYS), role)
@@ -170,15 +193,35 @@ def validate(c: dict, role: str):
                 raise ValueError(f"{key} must be integer {minimum}..{maximum}")
         if type(c["mkcp_congestion"]) is not bool:
             raise ValueError("mkcp_congestion must be boolean")
-        for key in ("udp_port", "xray_udp_port", "socks_port", "control_port"):
+        for key in ("udp_port", "xray_udp_port", "socks_port", "control_port",
+                    "control_proxy_port", "control_cf_port"):
             port(c[key], key)
-        if len({c["udp_port"], c["xray_udp_port"], c["socks_port"], c["web_port"]}) != 4:
+        if len({c["udp_port"], c["xray_udp_port"], c["socks_port"],
+                c["control_proxy_port"], c["web_port"]}) != 5:
             raise ValueError("A listening ports must be distinct")
         if not isinstance(c["udp_bind"], str) or not c["udp_bind"]:
             raise ValueError("udp_bind required")
         if not isinstance(c["control_host"], str) or not c["control_host"]:
             raise ValueError("control_host required")
-        socks_uri(c["control_socks5"], "control_socks5")
+        for key in ("control_cf_address", "control_cf_uuid", "control_cf_server_name",
+                    "control_cf_ws_host", "control_cf_ws_path"):
+            if not isinstance(c[key], str):
+                raise ValueError(f"{key} must be a string")
+        for key in ("control_cf_address", "control_cf_server_name", "control_cf_ws_host"):
+            if c[key] and (any(char.isspace() for char in c[key]) or
+                           any(char in c[key] for char in "/@")):
+                raise ValueError(f"{key} must be a hostname or IP without URL/whitespace")
+        if not c["control_cf_ws_path"].startswith("/") or "#" in c["control_cf_ws_path"]:
+            raise ValueError("control_cf_ws_path must begin with / (no fragment)")
+        if c["control_cf_uuid"]:
+            try:
+                if str(uuid.UUID(c["control_cf_uuid"])) != c["control_cf_uuid"].lower():
+                    raise ValueError("invalid UUID")
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("control_cf_uuid must be canonical VLESS UUID") from exc
+        if any(c[key] for key in ("control_cf_address", "control_cf_uuid",
+                                 "control_cf_server_name", "control_cf_ws_host")) and not control_cf_ready(c):
+            raise ValueError("CF node is incomplete: address, UUID, SNI and WS Host are required")
         if not isinstance(c["stun_servers"], list) or not c["stun_servers"] or len(c["stun_servers"]) > 4:
             raise ValueError("stun_servers must contain 1..4 endpoints")
         for server in c["stun_servers"]:

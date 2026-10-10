@@ -23,7 +23,13 @@
   "stun_confirm": 2,
   "register_refresh": 1800,
   "register_retry": 15,
-  "control_socks5": "socks5://127.0.0.1:10810",
+  "control_proxy_port": 10909,
+  "control_cf_address": "",
+  "control_cf_port": 443,
+  "control_cf_uuid": "",
+  "control_cf_server_name": "",
+  "control_cf_ws_host": "",
+  "control_cf_ws_path": "/",
   "control_host": "CHANGE_TO_B_CONTROL_HOST",
   "control_port": 18080
 }

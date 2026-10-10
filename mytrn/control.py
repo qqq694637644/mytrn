@@ -1,4 +1,4 @@
-"""Low-frequency endpoint registration over A's existing CF/VLESS SOCKS5 route."""
+"""A STUN endpoint registration via its OWN Xray CF/VLESS control outbound."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp_socks import ProxyConnector
 
-from .config import load_json, save_json, validate_a_certificate
+from .config import control_cf_ready, load_json, save_json, validate_a_certificate
 
 LOG = logging.getLogger("mytrn.control")
 
@@ -20,9 +20,12 @@ LOG = logging.getLogger("mytrn.control")
 async def register_from_a(config: dict, ip: str, port: int, certificate: str) -> dict:
     if config["control_host"].startswith("CHANGE_"):
         raise ValueError("Set A control_host in Web UI before registering")
-    # The only control path from A to B: v2rayN SOCKS5 -> CF/VLESS -> B.
-    # Never access B public IP directly from A to 'fall back'.
-    connector = ProxyConnector.from_url(config["control_socks5"], rdns=True)
+    if not control_cf_ready(config):
+        raise ValueError("Configure A CF/VLESS address, UUID, TLS SNI and WS Host before registering")
+    # Python -> its own Xray loopback SOCKS5 -> CF CDN/VLESS -> B Go HTTP.
+    # v2rayN is ONLY the user traffic collector: never use its 10810 port,
+    # the MyTRN data SOCKS5 10808, or any direct connection to B as fallback.
+    connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{config['control_proxy_port']}", rdns=True)
     url = f"http://{config['control_host']}:{config['control_port']}/control/mapping"
     body = {"node": "a", "ip": ip, "port": port, "certificate": certificate}
     async with ClientSession(connector=connector, timeout=ClientTimeout(total=15), trust_env=False) as session:

@@ -24,6 +24,9 @@ input{font:inherit;padding:9px;max-width:100%;width:350px;border:1px solid #bdc9
 input[type=number]{width:145px;box-sizing:border-box}
 input[type=checkbox]{width:auto}
 button{padding:9px 14px;margin:8px 8px 8px 0;background:#1f507a;color:white;border:0;border-radius:7px;cursor:pointer}
+.cf-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px 20px;margin:14px 0}
+.cf-grid label{display:flex;flex-direction:column;gap:4px}
+.cf-grid input{box-sizing:border-box;width:100%}
 .mkcp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:14px 20px;margin:14px 0}
 .mkcp-grid label{display:flex;flex-direction:column;gap:4px}
 .mkcp-grid label.checkbox{flex-direction:row;align-items:center}
@@ -33,6 +36,23 @@ small{color:#566478}h1{margin-bottom:0}
 <input id="token" type="password" autocomplete="off"><button id="refresh">读取状态与配置</button>
 <button id="probe">从 A 验证外网出口</button>
 <h3>运行状态</h3><pre id="status">请输入 token 并读取</pre>
+<section id="cf-panel" hidden>
+<h3>控制面：CF CDN / VLESS（A 自有 Xray）</h3>
+<p><small>Python 经 A Xray 的 10909 本地控制 SOCKS5，使用 VLESS + TLS + WebSocket 到现有 CF CDN 节点。v2rayN 只负责把本机上网流量交给 10808，不参与控制请求。以下参数请从当前已能使用的 CF/VLESS 节点照实填写；控制 HTTP 的目标是 B x-ui Go 服务。</small></p>
+<div class="cf-grid">
+<label>CF 节点地址（CDN 域名 / IP）<input id="control_cf_address" placeholder="你的 CF CDN 入口地址"></label>
+<label>CF 节点端口（通常 443）<input id="control_cf_port" type="number" min="1" max="65535"></label>
+<label>CF 节点 VLESS UUID（不是 MyTRN UUID）<input id="control_cf_uuid" placeholder="现有 VLESS 26417 节点 UUID"></label>
+<label>TLS SNI<input id="control_cf_server_name" placeholder="CF 证书对应的 SNI"></label>
+<label>WebSocket Host<input id="control_cf_ws_host" placeholder="现有节点 WS Host"></label>
+<label>WebSocket Path<input id="control_cf_ws_path" placeholder="/你的实际路径"></label>
+<label>B 控制 HTTP 主机/IP<input id="control_host" placeholder="B 的 HTTP 控制地址"></label>
+<label>B 控制 HTTP 端口<input id="control_port" type="number" min="1" max="65535"></label>
+<label>A 控制专用本地 SOCKS5 端口<input id="control_proxy_port" type="number" min="1" max="65535"></label>
+</div>
+<button id="cf-save">保存控制面配置</button>
+<p><small>保存后按提示重启 Python Agent，A Xray 会自动生成控制出站并做配置校验。没有填好节点时控制面不发出直连请求，也不回退 v2rayN。修改不涉及 B 现有 CF/Caddy/VLESS 配置。</small></p>
+</section>
 <section id="mkcp-panel" hidden>
 <h3>A 端 mKCP 传输参数</h3>
 <p><small>当前 A Xray 入站默认 MTU=1200，其余使用 Xray 26.3.27 默认值。调参只重启 A 的 Xray 子进程，STUN/UDP 39999 网关不断开；B 在 x-ui 的 MyTRN 设置中单独调整。B/A 的 MTU 请保持兼容。</small></p>
@@ -48,11 +68,19 @@ small{color:#566478}h1{margin-bottom:0}
 <button id="mkcp-save">保存并应用 A 的 mKCP</button><button id="mkcp-reset">恢复原有参数</button>
 <p><small>readBufferSize 在当前 Xray 版本中虽支持配置，但实际读取窗口没有使用该值。header、seed 已被移除，不提供这些无效选项。</small></p>
 </section>
-<h3>配置（JSON）</h3><p><small>只编辑 mytrn 参数，不直接编辑 Xray 内核 JSON。仅修改 A 的 mKCP 参数时自动应用，其他配置保存后仍需重启 Python Agent；B 必须使用相同的 control_token 和 vless_uuid。</small></p>
+<h3>配置（JSON）</h3><p><small>只编辑 mytrn 参数，不直接编辑 Xray 内核 JSON。仅修改 A 的 mKCP 参数时自动应用，控制面等其他配置保存后仍需重启 Python Agent；B MyTRN 使用同一 control_token 和 vless_uuid，CF 节点另用它自己的 VLESS UUID。</small></p>
 <textarea id="config" spellcheck="false"></textarea><button id="save">校验并保存</button>
 <pre id="message"></pre>
 </main><script>
 const $=(id)=>document.getElementById(id);$('token').value=localStorage.getItem('mytrn.admin')||'';
+const cfKeys=['control_cf_address','control_cf_port','control_cf_uuid','control_cf_server_name',
+              'control_cf_ws_host','control_cf_ws_path','control_host','control_port','control_proxy_port'];
+function showCf(config){$('cf-panel').hidden=config.role!=='a';if(config.role!=='a')return;
+for(const key of cfKeys)$(key).value=config[key]===undefined?'':config[key];}
+function getCf(){const data={};for(const key of cfKeys){const raw=$(key).value.trim();
+if(['control_cf_port','control_port','control_proxy_port'].includes(key)){
+if(!/^\d+$/.test(raw))throw Error(key+' 必须是整数端口');data[key]=Number(raw);
+}else data[key]=raw;}return data;}
 const mkcpKeys=['mkcp_mtu','mkcp_tti','mkcp_uplink_capacity','mkcp_downlink_capacity','mkcp_read_buffer_size','mkcp_write_buffer_size','mkcp_congestion'];
 const mkcpDefaults={mkcp_mtu:1200,mkcp_tti:50,mkcp_uplink_capacity:5,mkcp_downlink_capacity:20,mkcp_read_buffer_size:2,mkcp_write_buffer_size:2,mkcp_congestion:false};
 function showMkcp(config){$('mkcp-panel').hidden=config.role!=='a';if(config.role!=='a')return;
@@ -65,9 +93,14 @@ const opts={method,headers:{'X-Admin-Token':$('token').value,'Content-Type':'app
 if(value!==undefined)opts.body=JSON.stringify(value);
 const resp=await fetch(path,opts),result=await resp.json();if(!resp.ok)throw Error(result.error||String(resp.status));return result;}
 $('refresh').onclick=async()=>{try{$('status').textContent=JSON.stringify(await api('/api/status'),null,2);
-$('config').value=JSON.stringify(await api('/api/config'),null,2);showMkcp(JSON.parse($('config').value));$('message').textContent='读取成功';}catch(e){$('message').textContent=e.message;}};
+$('config').value=JSON.stringify(await api('/api/config'),null,2);showMkcp(JSON.parse($('config').value));
+showCf(JSON.parse($('config').value));$('message').textContent='读取成功';}catch(e){$('message').textContent=e.message;}};
 $('save').onclick=async()=>{try{const obj=JSON.parse($('config').value);
-$('message').textContent=(await api('/api/config','POST',obj)).message;showMkcp(obj);}catch(e){$('message').textContent=e.message;}};
+$('message').textContent=(await api('/api/config','POST',obj)).message;showMkcp(obj);showCf(obj);}catch(e){$('message').textContent=e.message;}};
+$('cf-save').onclick=async()=>{try{const config=await api('/api/config');
+if(config.role!=='a')throw Error('控制面配置仅用于 A Python');Object.assign(config,getCf());
+const result=await api('/api/config','POST',config);$('config').value=JSON.stringify(config,null,2);
+$('message').textContent=result.message;showCf(config);}catch(e){$('message').textContent=e.message;}};
 $('mkcp-save').onclick=async()=>{try{const config=await api('/api/config');
 if(config.role!=='a')throw Error('mKCP 表单仅用于 A Python');Object.assign(config,getMkcp());
 const result=await api('/api/config','POST',config);$('config').value=JSON.stringify(config,null,2);

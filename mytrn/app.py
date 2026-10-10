@@ -7,7 +7,7 @@ import logging
 import time
 from pathlib import Path
 
-from .config import create_a_identity, load_json, state_dir, validate, write_text
+from .config import control_cf_ready, create_a_identity, load_json, state_dir, validate, write_text
 from .control import ControlServer, register_from_a
 from .udp import UdpGateway
 from .web import WebUI
@@ -172,6 +172,9 @@ class Agent:
             status.update({"stun_last_success": self.last_stun,
                            "stun_consecutive_failures": self.stun_failures,
                            "control_last_registration": self.last_registration,
+                           "control_transport": "own-xray-vless-ws-tls-via-cf",
+                           "control_configured": control_cf_ready(self.config),
+                           "control_local_socks": f"127.0.0.1:{self.config['control_proxy_port']}",
                            "gateway": self.gateway.status() if self.gateway else {},
                            "proxy_end_to_end_test": self.proxy_probe})
         else:

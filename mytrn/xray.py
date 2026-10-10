@@ -16,7 +16,7 @@ from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .config import TLS_NAME, XRAY_VERSION, mkcp_settings, save_json
+from .config import TLS_NAME, XRAY_VERSION, control_cf_ready, mkcp_settings, save_json
 
 LOG = logging.getLogger("mytrn.xray")
 
@@ -31,10 +31,34 @@ def binary_path(value: str) -> str:
 
 
 def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
+    # The same managed Xray process carries TWO strictly separated paths:
+    # local user SOCKS5 -> native VLESS reverse/mKCP (B -> A transport), and
+    # Python's own control SOCKS5 -> CF CDN/VLESS over TLS+WebSocket.
+    # The UDP 39999/STUN gateway remains a separate Python socket; 40001 is
+    # Xray's private mKCP UDP listener, not a second public NAT mapping.
+    outbounds = [{"tag": "deny", "protocol": "blackhole"}]
+    control_outbound = "deny"
+    if control_cf_ready(c):
+        outbounds.append({
+            "tag": "cf-control", "protocol": "vless",
+            "settings": {"address": c["control_cf_address"],
+                         "port": c["control_cf_port"], "id": c["control_cf_uuid"],
+                         "encryption": "none"},
+            "streamSettings": {
+                "network": "ws", "security": "tls",
+                "tlsSettings": {"serverName": c["control_cf_server_name"],
+                                "allowInsecure": False},
+                "wsSettings": {"path": c["control_cf_ws_path"],
+                               "headers": {"Host": c["control_cf_ws_host"]}},
+            },
+        })
+        control_outbound = "cf-control"
     return {
         "log": {"loglevel": "info"},
         "inbounds": [
             {"tag": "a-local-socks", "listen": "127.0.0.1", "port": c["socks_port"],
+             "protocol": "socks", "settings": {"auth": "noauth", "udp": False}},
+            {"tag": "a-control-socks", "listen": "127.0.0.1", "port": c["control_proxy_port"],
              "protocol": "socks", "settings": {"auth": "noauth", "udp": False}},
             {"tag": "a-mkcp", "listen": "127.0.0.1", "port": c["xray_udp_port"],
              "protocol": "vless", "settings": {"decryption": "none", "clients": [
@@ -47,9 +71,10 @@ def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
                                      "keyFile": str(keyfile.resolve())},
                                 ]}}},
         ],
-        "outbounds": [{"tag": "deny", "protocol": "blackhole"}],
+        "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": [
             {"type": "field", "inboundTag": ["a-local-socks"], "outboundTag": "reverse-out"},
+            {"type": "field", "inboundTag": ["a-control-socks"], "outboundTag": control_outbound},
         ]},
     }
 

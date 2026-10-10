@@ -43,7 +43,7 @@ def main() -> int:
         print(f"Created private {path} (do not commit to GitHub)")
         print(f"Web admin_token: {config['admin_token']}")
         print("Copy A control_token and vless_uuid into B via the respective Web UIs.")
-        print("Set both xray_bin executable paths and A control_host in Web UI before testing.")
+        print("Set A Xray path, B control_host, and your existing CF/VLESS TLS+WS node parameters in A Web UI.")
         return 0
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
