@@ -10,7 +10,7 @@ import time
 from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp_socks import ProxyConnector
 
-from .config import A_MKCP_DEFAULTS, load_json, save_json, validate
+from .config import HY2_KEYS, load_json, save_json, validate
 from .control import check_control_route
 
 LOG = logging.getLogger("mytrn.web")
@@ -52,7 +52,7 @@ details{margin-top:12px}summary{cursor:pointer;color:var(--blue);font-weight:600
 .status-pill{display:inline-block;background:#eff4fb;border-radius:5px;padding:4px 9px;font-size:13px;margin-right:6px}
 @media(max-width:700px){main{margin:12px auto;padding:0 10px 24px}.panel,section.panel{padding:16px}.grid{grid-template-columns:minmax(0,1fr)}.auth{grid-template-columns:minmax(0,1fr)}.field.full{grid-column:auto}button{max-width:100%}}
 </style></head><body><main>
-<header><h1>MyTRN · A 端管理</h1><p class="subtitle">Python 管理一个 Xray：控制面走 CF/XHTTP，用户数据面走 mKCP；v2rayN 只负责本机流量入口。</p></header>
+<header><h1>MyTRN · A 端管理</h1><p class="subtitle">Python 管理一个 Xray：控制面走 CF/XHTTP，用户数据面走原生 Hysteria 2 QUIC + Brutal；v2rayN 只负责本机流量入口。</p></header>
 <section class="panel">
   <h2>管理与运行状态</h2>
   <div class="auth"><label class="field"><span>本地 Web 管理 Token</span><input id="token" type="password" autocomplete="off" placeholder="请输入 admin_token"></label>
@@ -82,20 +82,15 @@ details{margin-top:12px}summary{cursor:pointer;color:var(--blue);font-weight:600
   <div class="actions"><button id="cf-save">保存控制面配置</button><button id="cf-check" class="secondary">检测 CF → B 控制链路（只读）</button></div>
   <p class="hint">控制面修改后必须重启 A Python Agent 才会应用。检测使用<strong>当前正在运行</strong>的 Xray 配置，仅检查 B Go HTTP 可达性，不修改 A/B 映射。</p>
 </section>
-<section id="mkcp-panel" class="panel" hidden>
-  <h2>A 端 mKCP 数据面参数</h2>
-  <p class="hint">A Xray 在回环 UDP 40001 处理 VLESS/mKCP/TLS，Python UDP 39999 做 STUN 和数据报转发。下面只修改 mKCP；保存后由 Python 校验并重启 A 的 Xray 子进程，不重启 UDP 网关。</p>
+<section id="hy2-panel" class="panel" hidden>
+  <h2>A 端 Hysteria 2 / Brutal 数据面</h2>
+  <p class="hint">A Xray 在回环 UDP 40001 处理 VLESS reverse / QUIC；Python UDP 39999 保持原有 STUN 和数据报转发。Brutal 使用 Xray 26.3.27 原生实现，修改后自动校验并重启 A Xray 子进程，不重启 UDP 网关。</p>
   <div class="grid">
-    <label class="field"><span>MTU（字节）</span><input id="mkcp_mtu" type="number" min="576" max="1460" step="1"></label>
-    <label class="field"><span>TTI（毫秒）</span><input id="mkcp_tti" type="number" min="10" max="1000" step="1"></label>
-    <label class="field"><span>上行容量（MB/s）</span><input id="mkcp_uplink_capacity" type="number" min="1" max="1000" step="1"></label>
-    <label class="field"><span>下行容量（MB/s）</span><input id="mkcp_downlink_capacity" type="number" min="1" max="1000" step="1"></label>
-    <label class="field"><span>读缓冲（MB）</span><input id="mkcp_read_buffer_size" type="number" min="1" max="256" step="1"></label>
-    <label class="field"><span>写缓冲（MB）</span><input id="mkcp_write_buffer_size" type="number" min="1" max="256" step="1"></label>
-    <label class="checkbox field full"><input id="mkcp_congestion" type="checkbox"><span>启用拥塞控制</span></label>
+    <label class="field"><span>A 发送目标（Mbps）</span><input id="hy2_up_mbps" type="number" min="1" max="10000" step="1"></label>
+    <label class="field"><span>A 接收目标（Mbps）</span><input id="hy2_down_mbps" type="number" min="1" max="10000" step="1"></label>
   </div>
-  <div class="actions"><button id="mkcp-save">保存并应用 A 的 mKCP</button><button id="mkcp-reset" class="secondary">填写原有默认值</button></div>
-  <p class="hint">“填写原有默认值”只修改输入框，必须点击保存才会写入。readBufferSize 在当前 Xray 版本中不参与读取窗口计算。</p>
+  <div class="actions"><button id="hy2-save">保存并应用 A 的 Hysteria 2</button><button id="hy2-reset" class="secondary">填写 64/64 默认值</button></div>
+  <p class="hint">两端的速率分别配置，协商后按更小的发送/接收目标生效；Brutal 根据 ACK 比例进行丢包补偿，实际发包可能高于标称 Mbps。TLS 使用固定证书及 ALPN h3，隧道认证由 control_token 派生，不增加第二份明文密钥。</p>
 </section>
 <section class="panel"><details id="advanced"><summary>高级 · JSON 配置（包含凭据）</summary>
   <p class="hint">这是 mytrn 配置，不是 Xray 内核 JSON。建议优先使用上面两个表单；高级编辑完成后校验并保存。这里包含 UUID 和 Token，请勿公开分享。</p>
@@ -109,19 +104,16 @@ const cfKeys=['control_cf_address','control_cf_port','control_cf_uuid','control_
   'control_cf_xhttp_host','control_cf_xhttp_path','control_cf_xhttp_mode',
   'control_cf_fingerprint','control_cf_alpn','control_host','control_port','control_proxy_port'];
 const numericCfKeys=['control_cf_port','control_port','control_proxy_port'];
-const mkcpKeys=['mkcp_mtu','mkcp_tti','mkcp_uplink_capacity','mkcp_downlink_capacity',
-  'mkcp_read_buffer_size','mkcp_write_buffer_size','mkcp_congestion'];
-const mkcpDefaults={mkcp_mtu:1200,mkcp_tti:50,mkcp_uplink_capacity:5,mkcp_downlink_capacity:20,
-  mkcp_read_buffer_size:2,mkcp_write_buffer_size:2,mkcp_congestion:false};
+const hy2Keys=['hy2_up_mbps','hy2_down_mbps'];
+const hy2Defaults={hy2_up_mbps:64,hy2_down_mbps:64};
 function showCf(config){$('cf-panel').hidden=config.role!=='a';if(config.role!=='a')return;
   for(const key of cfKeys)$(key).value=config[key]===undefined?'':config[key];}
-function showMkcp(config){$('mkcp-panel').hidden=config.role!=='a';if(config.role!=='a')return;
-  for(const key of mkcpKeys){const value=config[key]===undefined?mkcpDefaults[key]:config[key];
-    if(key==='mkcp_congestion')$(key).checked=value;else $(key).value=value;}}
+function showHy2(config){$('hy2-panel').hidden=config.role!=='a';if(config.role!=='a')return;
+  for(const key of hy2Keys)$(key).value=config[key]===undefined?hy2Defaults[key]:config[key];}
 function getCf(){const result={};for(const key of cfKeys){const raw=$(key).value.trim();
   if(numericCfKeys.includes(key)){if(!/^\d+$/.test(raw))throw Error(key+' 必须是整数端口');result[key]=Number(raw);}
   else result[key]=raw;}return result;}
-function getMkcp(){const result={};for(const key of mkcpKeys){if(key==='mkcp_congestion'){result[key]=$(key).checked;continue;}
+function getHy2(){const result={};for(const key of hy2Keys){
   const raw=$(key).value.trim();if(!/^\d+$/.test(raw))throw Error(key+' 必须是整数');result[key]=Number(raw);}return result;}
 function message(text,isError=false){$('message').textContent=text;$('message').style.color=isError?'#a11f2f':'#244665';}
 async function api(path,method='GET',value){localStorage.setItem('mytrn.admin',$('token').value);
@@ -139,7 +131,7 @@ function renderStatus(status){$('status').textContent=JSON.stringify(status,null
   $('runtime-summary').textContent=items.join(' · ');
 }
 async function reload(){const config=await api('/api/config');
-  $('config').value=JSON.stringify(config,null,2);showCf(config);showMkcp(config);
+  $('config').value=JSON.stringify(config,null,2);showCf(config);showHy2(config);
   renderStatus(await api('/api/status'));return config;}
 async function operation(button,work){button.disabled=true;try{return await work();}catch(err){message(err.message,true);}
   finally{button.disabled=false;}}
@@ -149,15 +141,15 @@ $('save').onclick=()=>operation($('save'),async()=>{const config=JSON.parse($('c
 $('cf-save').onclick=()=>operation($('cf-save'),async()=>{const config=await api('/api/config');
   if(config.role!=='a')throw Error('CF 控制面设置仅用于 A');Object.assign(config,getCf());
   const result=await api('/api/config','POST',config);await reload();message(result.message);});
-$('mkcp-save').onclick=()=>operation($('mkcp-save'),async()=>{const config=await api('/api/config');
-  if(config.role!=='a')throw Error('mKCP 设置仅用于 A');Object.assign(config,getMkcp());
+$('hy2-save').onclick=()=>operation($('hy2-save'),async()=>{const config=await api('/api/config');
+  if(config.role!=='a')throw Error('Hysteria 2 设置仅用于 A');Object.assign(config,getHy2());
   const result=await api('/api/config','POST',config);await reload();message(result.message);});
-$('mkcp-reset').onclick=()=>showMkcp({role:'a',...mkcpDefaults});
+$('hy2-reset').onclick=()=>showHy2({role:'a',...hy2Defaults});
 $('cf-check').onclick=()=>operation($('cf-check'),async()=>{
   message('正在通过 A 自有 Xray 的 CF/XHTTP 出站检测 B Go 控制 API（不会更改 endpoint）...');
   const result=await api('/api/control/check','POST',{});message(result.message);});
 $('probe').onclick=()=>operation($('probe'),async()=>{
-  message('正在通过 A 数据 SOCKS5 → mKCP → B freedom 检测互联网出口...');
+  message('正在通过 A 数据 SOCKS5 → Hysteria 2/Brutal → B freedom 检测互联网出口...');
   const result=await api('/api/probe','POST',{});message(JSON.stringify(result,null,2));});
 </script></body></html>"""
 
@@ -195,14 +187,14 @@ class WebUI:
             validate(new_config, self.agent.role)
             changed = {key for key in new_config if new_config[key] != self.agent.config.get(key)}
             save_json(self.agent.path, new_config)
-            if self.agent.role == "a" and changed <= A_MKCP_DEFAULTS.keys() and not self.agent.restart_required:
-                # The Xray supervisor applies ONLY mKCP changes while the
+            if self.agent.role == "a" and changed <= HY2_KEYS and not self.agent.restart_required:
+                # The Xray supervisor applies ONLY Hysteria rate changes while the
                 # Python STUN/UDP socket continues using its current config.
                 self.agent.config = new_config
                 if changed:
                     self.agent.proxy_probe = None
                 return web.json_response({"ok": True, "message":
-                    "mKCP 已保存，A 的 Xray 将自动校验并应用；Python/UDP 39999 无需重启。"})
+                    "Hysteria Brutal 已保存，A 的 Xray 将自动校验并应用；Python/UDP 39999 无需重启。"})
             if changed:
                 self.agent.restart_required = True
         except (ValueError, TypeError, json.JSONDecodeError) as exc:

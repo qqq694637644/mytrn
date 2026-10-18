@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .app import Agent
-from .config import init_config
+from .config import init_config, migrate_to_hysteria2
 
 
 async def run(role: str, path: Path):
@@ -23,7 +23,7 @@ async def run(role: str, path: Path):
 
 
 def main() -> int:
-    cli = argparse.ArgumentParser(description="A uses B Internet; B dials A over WARP SOCKS5 UDP/Xray mKCP")
+    cli = argparse.ArgumentParser(description="A uses B Internet; B dials A over WARP SOCKS5 UDP/Xray Hysteria2 Brutal")
     subs = cli.add_subparsers(dest="command", required=True)
     for role in ("a", "b"):
         task = subs.add_parser(role, help=f"start {role.upper()} agent")
@@ -32,6 +32,9 @@ def main() -> int:
     initial = subs.add_parser("init", help="create private JSON config with random tokens")
     initial.add_argument("role", choices=("a", "b"))
     initial.add_argument("--config", type=Path)
+    migration = subs.add_parser("migrate-hy2", help="one-time destructive mKCP to Hysteria2 config migration")
+    migration.add_argument("--role", choices=("a", "b"), default="a")
+    migration.add_argument("--config", type=Path)
     args = cli.parse_args()
     if args.command == "init":
         path = args.config or Path(f"config.{args.role}.json")
@@ -43,7 +46,16 @@ def main() -> int:
         print(f"Created private {path} (do not commit to GitHub)")
         print(f"Web admin_token: {config['admin_token']}")
         print("Copy A control_token and vless_uuid into B via the respective Web UIs.")
-        print("Set A Xray path, B control_host, and your existing CF/VLESS TLS+WS node parameters in A Web UI.")
+        print("Set A Xray path, B control_host, and your existing CF/VLESS TLS+XHTTP node parameters in A Web UI.")
+        return 0
+    if args.command == "migrate-hy2":
+        path = args.config or Path(f"config.{args.role}.json")
+        try:
+            changed = migrate_to_hysteria2(path, args.role)
+        except (FileExistsError, OSError, ValueError) as exc:
+            print(f"MyTRN Hy2 migration failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"{path}: {'migrated to Hy2-only; backup saved as ' + path.name + '.before-hy2.json' if changed else 'already Hy2-only'}")
         return 0
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")

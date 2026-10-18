@@ -9,5 +9,7 @@
   "state_dir": "state.b",
   "control_bind": "127.0.0.1",
   "control_port": 18080,
-  "warp_socks5": "socks5://127.0.0.1:40000"
+  "warp_socks5": "socks5://127.0.0.1:40000",
+  "hy2_up_mbps": 64,
+  "hy2_down_mbps": 64
 }
