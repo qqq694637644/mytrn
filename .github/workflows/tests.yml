@@ -1,0 +1,48 @@
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  python:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install requirements
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Fetch Xray-core v26.3.27 for native reverse/mKCP PoC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($IsWindows) {
+            $archiveName = 'Xray-windows-64.zip'
+            $expected = 'd004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad'
+            $binaryName = 'xray.exe'
+          } else {
+            $archiveName = 'Xray-linux-64.zip'
+            $expected = '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae'
+            $binaryName = 'xray'
+          }
+          $url = "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/$archiveName"
+          Invoke-WebRequest -Uri $url -OutFile $archiveName
+          $actual = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Xray archive SHA256 mismatch: $actual" }
+          Expand-Archive $archiveName -DestinationPath '.xray-ci' -Force
+          $binary = (Resolve-Path (Join-Path '.xray-ci' $binaryName)).Path
+          if (-not $IsWindows) { & chmod +x $binary; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+          & $binary version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content -Path $env:GITHUB_ENV -Value "MYTRN_XRAY_BIN=$binary"
+      - name: Compile Python source
+        run: python -m compileall -q mytrn tests poc/xray26327
+      - name: Python A/B agents, endpoint recovery and real Xray 26.3.27 integration
+        run: python -m pytest -q
