@@ -1,6 +1,6 @@
 """Python agent verification with real Xray v26.3.27 and mock CF/WARP SOCKS5.
 
-Only transport infrastructure is mocked. VLESS reverse, mKCP, TLS and
+Only transport infrastructure is mocked. VLESS reverse, Hysteria2/Brutal, TLS and
 TCP forwarding all run inside real Xray, never the deleted Python QUIC agent.
 """
 
@@ -18,9 +18,9 @@ import pytest
 from aiohttp import ClientSession, web
 
 from mytrn.app import Agent
-from mytrn.config import (A_CF_DEFAULTS, A_MKCP_DEFAULTS, TLS_NAME, control_cf_ready,
-                          create_a_identity, defaults, load_json,
-                          mkcp_settings, save_json, validate, validate_a_certificate)
+from mytrn.config import (A_CF_DEFAULTS, HY2_DEFAULTS, TLS_NAME, control_cf_ready,
+                          create_a_identity, defaults, hysteria_auth, load_json,
+                          migrate_to_hysteria2, save_json, validate, validate_a_certificate)
 from mytrn.control import ControlServer, check_control_route, register_from_a
 from mytrn.udp import STUN_MAGIC, UdpGateway, parse_stun
 from mytrn.xray import XrayProcess, make_a, make_b
@@ -193,13 +193,13 @@ def test_strict_config_and_certificates(tmp_path):
     assert wanted["outbounds"][2]["protocol"] == "freedom"
 
 
-def test_a_managed_cf_vless_control_is_separate_from_mkcp_and_v2rayn(tmp_path):
+def test_a_managed_cf_vless_control_is_separate_from_hysteria_and_v2rayn(tmp_path):
     a = defaults("a")
     cert, key, _, _ = create_a_identity(tmp_path)
     # Without CF credentials, only the independent data plane is active.
     empty = make_a(a, cert, key)
     assert [entry["tag"] for entry in empty["inbounds"]] == [
-        "a-local-socks", "a-control-socks", "a-mkcp"]
+        "a-local-socks", "a-control-socks", "a-hysteria2"]
     assert empty["inbounds"][0]["port"] == 10808
     assert empty["inbounds"][1]["port"] == 10909
     assert empty["inbounds"][2]["port"] == 40001
@@ -232,7 +232,8 @@ def test_a_managed_cf_vless_control_is_separate_from_mkcp_and_v2rayn(tmp_path):
     assert stream["xhttpSettings"] == {
         "path": "/secure-xhttp", "host": "edge.example.test", "mode": "packet-up"}
     assert "wsSettings" not in stream
-    assert config["inbounds"][2]["streamSettings"]["kcpSettings"] == {"mtu": 1200}
+    assert config["inbounds"][2]["streamSettings"]["network"] == "hysteria"
+    assert config["inbounds"][2]["streamSettings"]["tlsSettings"]["alpn"] == ["h3"]
     text = json.dumps(config)
     assert "10810" not in text and "control_socks5" not in text
 
@@ -369,55 +370,94 @@ def test_readonly_control_check_verifies_b_go_signature_without_registration():
     asyncio.run(scenario())
 
 
-def test_a_mkcp_defaults_migration_and_generated_xray_settings(tmp_path):
+def test_hysteria_brutal_only_generates_authenticated_quic_settings(tmp_path):
     a = defaults("a")
-    # Original A config.a.json never had mKCP fields. It must keep the
-    # same effective Xray behaviour and its existing identity and ports.
     original_uuid = a["vless_uuid"]
     original_token = a["control_token"]
-    for key in A_MKCP_DEFAULTS:
-        del a[key]
     validate(a, "a")
-    assert {key: a[key] for key in A_MKCP_DEFAULTS} == A_MKCP_DEFAULTS
+    assert {key: a[key] for key in HY2_DEFAULTS} == HY2_DEFAULTS
     assert a["vless_uuid"] == original_uuid and a["control_token"] == original_token
     assert a["udp_port"] == 39999
-    assert mkcp_settings(a) == {"mtu": 1200}
-
     identity, private_key, _, _ = create_a_identity(tmp_path)
     initial = make_a(a, identity, private_key)
-    assert initial["inbounds"][2]["streamSettings"]["kcpSettings"] == {"mtu": 1200}
-
-    a.update({"mkcp_mtu": 1100, "mkcp_tti": 25, "mkcp_uplink_capacity": 10,
-              "mkcp_downlink_capacity": 40, "mkcp_congestion": True,
-              "mkcp_read_buffer_size": 4, "mkcp_write_buffer_size": 8})
+    a_stream = initial["inbounds"][2]["streamSettings"]
+    assert a_stream["network"] == "hysteria"
+    assert a_stream["tlsSettings"]["alpn"] == ["h3"]
+    assert a_stream["hysteriaSettings"] == {"version": 2, "auth": hysteria_auth(original_token)}
+    assert a_stream["finalmask"]["quicParams"] == {
+        "congestion": "brutal", "brutalUp": "64mbps", "brutalDown": "64mbps",
+        "disablePathMTUDiscovery": True, "maxIdleTimeout": 15, "keepAlivePeriod": 5,
+    }
+    assert "kcpSettings" not in a_stream
+    assert len(hysteria_auth(original_token)) == 64
+    b = defaults("b")
+    b["control_token"] = original_token
+    b_stream = make_b(b, {"ip": "127.0.0.1", "port": 1234}, identity)["outbounds"][0]["streamSettings"]
+    assert b_stream["hysteriaSettings"] == a_stream["hysteriaSettings"]
+    assert b_stream["sockopt"] == {"dialerProxy": "warp-socks5"}
+    assert b_stream["tlsSettings"]["alpn"] == ["h3"]
+    assert b_stream["tlsSettings"]["disableSystemRoot"] is True
+    a.update({"hy2_up_mbps": 128, "hy2_down_mbps": 192})
     validate(a, "a")
-    tuned = make_a(a, identity, private_key)["inbounds"][2]["streamSettings"]["kcpSettings"]
-    assert tuned == {"mtu": 1100, "tti": 25, "uplinkCapacity": 10,
-                     "downlinkCapacity": 40, "congestion": True,
-                     "readBufferSize": 4, "writeBufferSize": 8}
+    tuned = make_a(a, identity, private_key)["inbounds"][2]["streamSettings"]["finalmask"]["quicParams"]
+    assert tuned["brutalUp"] == "128mbps" and tuned["brutalDown"] == "192mbps"
+    assert hysteria_auth(original_token) != hysteria_auth("changed-" + original_token)
 
 
 @pytest.mark.parametrize("key,value", [
-    ("mkcp_mtu", 575), ("mkcp_mtu", 1461),
-    ("mkcp_tti", 9), ("mkcp_tti", 1001),
-    ("mkcp_uplink_capacity", 0), ("mkcp_downlink_capacity", 1001),
-    ("mkcp_read_buffer_size", 0), ("mkcp_write_buffer_size", 257),
-    ("mkcp_congestion", 1), ("mkcp_mtu", True),
+    ("hy2_up_mbps", 0), ("hy2_up_mbps", 10001),
+    ("hy2_down_mbps", -1), ("hy2_down_mbps", 10001),
+    ("hy2_up_mbps", True), ("hy2_down_mbps", 1.5),
 ])
-def test_a_mkcp_strict_bounds(key, value):
+def test_hy2_strict_bounds(key, value):
     a = defaults("a")
     a[key] = value
-    with pytest.raises(ValueError, match="mkcp_"):
+    with pytest.raises(ValueError, match="hy2_"):
         validate(a, "a")
 
 
-def test_a_mkcp_web_save_applies_without_restart_python_gateway(tmp_path):
+def test_hy2_rejects_removed_mkcp_fields():
+    a = defaults("a")
+    a["mkcp_mtu"] = 1200
+    with pytest.raises(ValueError, match="mKCP data plane is removed"):
+        validate(a, "a")
+    b = defaults("b")
+    b["mkcp_congestion"] = True
+    with pytest.raises(ValueError, match="mKCP data plane is removed"):
+        validate(b, "b")
+
+
+def test_explicit_destructive_migration_preserves_identity_and_backup(tmp_path):
+    path = tmp_path / "config.a.json"
+    old = defaults("a")
+    for key in HY2_DEFAULTS:
+        del old[key]
+    old.update({"mkcp_mtu": 1200, "mkcp_tti": 50, "mkcp_congestion": False})
+    save_json(path, old)
+    assert migrate_to_hysteria2(path, "a")
+    converted = load_json(path)
+    validate(converted, "a")
+    assert converted["admin_token"] == old["admin_token"]
+    assert converted["control_token"] == old["control_token"]
+    assert converted["vless_uuid"] == old["vless_uuid"]
+    assert converted["udp_port"] == 39999
+    assert {key: converted[key] for key in HY2_DEFAULTS} == HY2_DEFAULTS
+    assert "mkcp_tti" not in converted and "mkcp_mtu" not in converted
+    backup = path.with_name(path.name + ".before-hy2.json")
+    assert load_json(backup) == old
+    assert not migrate_to_hysteria2(path, "a")
+    with pytest.raises(FileExistsError):
+        stale = dict(old, hy2_up_mbps=128)
+        save_json(path, stale)
+        migrate_to_hysteria2(path, "a")
+    assert load_json(backup) == old
+
+
+def test_hy2_web_save_applies_without_restart_python_gateway(tmp_path):
     async def scenario():
         a = defaults("a")
         a["web_port"] = free_port()
         a["state_dir"] = str(tmp_path / "state")
-        for key in A_MKCP_DEFAULTS:
-            del a[key]  # Simulate an existing real-world A installation.
         path = tmp_path / "config.a.json"
         save_json(path, a)
         agent = Agent("a", path)
@@ -429,22 +469,22 @@ def test_a_mkcp_web_save_applies_without_restart_python_gateway(tmp_path):
                 async with client.get(base + "/api/config", headers=headers) as response:
                     assert response.status == 200
                     current = await response.json()
-                assert current["mkcp_mtu"] == 1200 and current["mkcp_tti"] == 50
-                current["mkcp_tti"] = 25
-                current["mkcp_write_buffer_size"] = 8
+                assert current["hy2_up_mbps"] == 64 and current["hy2_down_mbps"] == 64
+                current["hy2_up_mbps"] = 128
+                current["hy2_down_mbps"] = 192
                 async with client.post(base + "/api/config", json=current, headers=headers) as response:
                     assert response.status == 200
                     result = await response.json()
                     assert "无需重启" in result["message"]
-                assert agent.config["mkcp_tti"] == 25
+                assert agent.config["hy2_up_mbps"] == 128
                 assert not agent.restart_required
-                assert load_json(path)["mkcp_write_buffer_size"] == 8
+                assert load_json(path)["hy2_down_mbps"] == 192
                 # Reject bad tunings without changing the saved or live state.
-                invalid = dict(current, mkcp_tti=1001)
+                invalid = dict(current, hy2_up_mbps=10001)
                 async with client.post(base + "/api/config", json=invalid, headers=headers) as response:
                     assert response.status == 400
-                assert agent.config["mkcp_tti"] == 25
-                assert load_json(path)["mkcp_tti"] == 25
+                assert agent.config["hy2_up_mbps"] == 128
+                assert load_json(path)["hy2_up_mbps"] == 128
                 # Unrelated config changes preserve the original manual
                 # Python Agent restart workflow.
                 changed_other = dict(current, register_refresh=1200)
@@ -506,7 +546,7 @@ async def actual_integration(tmp_path, xray_bin):
     cfg_b["vless_uuid"] = cfg_a["vless_uuid"]
     # Real v26.3.27 Xray simulates the EXISTING CF/VLESS/TLS+XHTTP h3 node.
     # It forwards the control HTTP request to the B Python test control
-    # server, while A's data reverse/mKCP still goes over the mock WARP UDP.
+    # server, while A's data reverse/Hysteria2 still goes over the mock WARP UDP.
     cf_uuid = str(uuid.uuid4())
     cf_port = free_port()
     cf_cert, cf_key, _, _ = create_a_identity(tmp_path / "cf-identity")
@@ -596,7 +636,7 @@ async def actual_integration(tmp_path, xray_bin):
             # Both Xray child processes may be running before reverse-in/out
             # finishes its initial handshake; retry the actual user request.
             try:
-                async with asyncio.timeout(30):
+                async with asyncio.timeout(85):
                     while True:
                         try:
                             return await proxy_http_request(a_socks, http_port, marker)

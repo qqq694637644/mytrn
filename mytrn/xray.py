@@ -1,6 +1,6 @@
 """Xray-core v26.3.27 config generator and dedicated process supervisor.
 
-Xray is the ONLY SOCKS/VLESS reverse/mKCP/TLS/TCP forwarding implementation.
+Xray is the ONLY SOCKS/VLESS reverse/Hysteria2/QUIC/Brutal forwarding implementation.
 These configurations were verified using the real v26.3.27 binary; do not
 replace them with the legacy VMess portal/bridge protocol.
 """
@@ -16,7 +16,7 @@ from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .config import TLS_NAME, XRAY_VERSION, control_cf_ready, mkcp_settings, save_json
+from .config import TLS_NAME, XRAY_VERSION, control_cf_ready, hysteria_stream, save_json
 
 LOG = logging.getLogger("mytrn.xray")
 
@@ -32,10 +32,10 @@ def binary_path(value: str) -> str:
 
 def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
     # The same managed Xray process carries TWO strictly separated paths:
-    # local user SOCKS5 -> native VLESS reverse/mKCP (B -> A transport), and
+    # local user SOCKS5 -> native VLESS reverse/Hysteria2 (B -> A transport), and
     # Python's own control SOCKS5 -> CF CDN/VLESS over XHTTP+TLS.
     # The UDP 39999/STUN gateway remains a separate Python socket; 40001 is
-    # Xray's private mKCP UDP listener, not a second public NAT mapping.
+    # Xray's private Hysteria QUIC UDP listener, not a second public NAT mapping.
     outbounds = [{"tag": "deny", "protocol": "blackhole"}]
     control_outbound = "deny"
     if control_cf_ready(c):
@@ -63,16 +63,14 @@ def make_a(c: dict, certfile: Path, keyfile: Path) -> dict:
              "protocol": "socks", "settings": {"auth": "noauth", "udp": False}},
             {"tag": "a-control-socks", "listen": "127.0.0.1", "port": c["control_proxy_port"],
              "protocol": "socks", "settings": {"auth": "noauth", "udp": False}},
-            {"tag": "a-mkcp", "listen": "127.0.0.1", "port": c["xray_udp_port"],
+            {"tag": "a-hysteria2", "listen": "127.0.0.1", "port": c["xray_udp_port"],
              "protocol": "vless", "settings": {"decryption": "none", "clients": [
                  {"id": c["vless_uuid"], "reverse": {"tag": "reverse-out"}},
              ]},
-             "streamSettings": {"network": "kcp", "security": "tls",
-                                "kcpSettings": mkcp_settings(c),
-                                "tlsSettings": {"certificates": [
+             "streamSettings": hysteria_stream(c, {"certificates": [
                                     {"certificateFile": str(certfile.resolve()),
                                      "keyFile": str(keyfile.resolve())},
-                                ]}}},
+                                ]})},
         ],
         "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": [
@@ -97,16 +95,12 @@ def make_b(c: dict, record: dict, certfile: Path) -> dict:
                 "address": record["ip"], "port": record["port"],
                 "id": c["vless_uuid"], "encryption": "none",
                 "reverse": {"tag": "reverse-in"},
-            }, "streamSettings": {
-                "network": "kcp", "security": "tls", "kcpSettings": {"mtu": 1200},
-                "tlsSettings": {
+            }, "streamSettings": hysteria_stream(c, {
                     "serverName": TLS_NAME, "allowInsecure": False,
                     "disableSystemRoot": True,
                     "certificates": [{"certificateFile": str(certfile.resolve()),
                                       "usage": "verify"}],
-                },
-                "sockopt": {"dialerProxy": "warp-socks5"},
-            }},
+                }, dialer_proxy="warp-socks5")},
             {"tag": "warp-socks5", "protocol": "socks", "settings": {
                 "servers": [socks_entry],
             }},

@@ -8,9 +8,12 @@ edited by this layer.
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+import hmac
 import json
 import os
 import secrets
+import shutil
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -33,6 +36,9 @@ A_KEYS = {"udp_bind", "udp_port", "xray_udp_port", "socks_port", "stun_servers",
           "control_cf_server_name", "control_cf_xhttp_host", "control_cf_xhttp_path",
           "control_cf_xhttp_mode", "control_cf_fingerprint", "control_cf_alpn"}
 B_KEYS = {"control_bind", "control_port", "warp_socks5"}
+HY2_KEYS = {"hy2_up_mbps", "hy2_down_mbps"}
+HY2_DEFAULTS = {"hy2_up_mbps": 64, "hy2_down_mbps": 64}
+HY2_AUTH_CONTEXT = b"mytrn-hysteria2-auth-v1"
 
 # CF/VLESS is generated directly by Python in A's Xray. Missing node fields
 # leave the control route disabled, not redirected through v2rayN or DIRECT.
@@ -56,33 +62,30 @@ def control_cf_ready(c: dict) -> bool:
     return all(c[key] for key in ("control_cf_address", "control_cf_uuid",
                                    "control_cf_server_name", "control_cf_xhttp_host"))
 
-# A originally set MTU=1200 and used the other Xray 26.3.27 defaults.
-A_MKCP_DEFAULTS = {
-    "mkcp_mtu": 1200,
-    "mkcp_tti": 50,
-    "mkcp_uplink_capacity": 5,
-    "mkcp_downlink_capacity": 20,
-    "mkcp_congestion": False,
-    "mkcp_read_buffer_size": 2,
-    "mkcp_write_buffer_size": 2,
-}
+def hysteria_auth(control_token: str) -> str:
+    """Separate Hy2 credentials from the control API via domain-separated HMAC."""
+    return hmac.new(control_token.encode("utf-8"), HY2_AUTH_CONTEXT, hashlib.sha256).hexdigest()
 
 
-def mkcp_settings(config: dict) -> dict:
-    """Only emit supported Xray v26.3.27 knobs, preserving the old default JSON."""
-    result = {"mtu": config.get("mkcp_mtu", 1200)}
-    for key, output in (
-        ("mkcp_tti", "tti"),
-        ("mkcp_uplink_capacity", "uplinkCapacity"),
-        ("mkcp_downlink_capacity", "downlinkCapacity"),
-        ("mkcp_read_buffer_size", "readBufferSize"),
-        ("mkcp_write_buffer_size", "writeBufferSize"),
-    ):
-        if config.get(key, A_MKCP_DEFAULTS[key]) != A_MKCP_DEFAULTS[key]:
-            result[output] = config[key]
-    if config.get("mkcp_congestion", False):
-        result["congestion"] = True
-    return result
+def hysteria_stream(config: dict, tls_settings: dict, *, dialer_proxy: str | None = None) -> dict:
+    """Xray 26.3.27 native Hysteria transport, QUIC + Brutal (bytes/sec negotiated)."""
+    stream = {
+        "network": "hysteria",
+        "security": "tls",
+        "hysteriaSettings": {"version": 2, "auth": hysteria_auth(config["control_token"])},
+        "tlsSettings": dict(tls_settings, alpn=["h3"]),
+        "finalmask": {"quicParams": {
+            "congestion": "brutal",
+            "brutalUp": f"{config['hy2_up_mbps']}mbps",
+            "brutalDown": f"{config['hy2_down_mbps']}mbps",
+            "disablePathMTUDiscovery": True,
+            "maxIdleTimeout": 15,
+            "keepAlivePeriod": 5,
+        }},
+    }
+    if dialer_proxy:
+        stream["sockopt"] = {"dialerProxy": dialer_proxy}
+    return stream
 
 
 def defaults(role: str) -> dict:
@@ -108,10 +111,11 @@ def defaults(role: str) -> dict:
             "control_host": "CHANGE_TO_B_CONTROL_HOST", "control_port": 18080,
         })
         c.update(A_CF_DEFAULTS)
-        c.update(A_MKCP_DEFAULTS)
+        c.update(HY2_DEFAULTS)
     else:
         c.update({"control_bind": "127.0.0.1", "control_port": 18080,
                   "warp_socks5": "socks5://127.0.0.1:40000"})
+        c.update(HY2_DEFAULTS)
     return c
 
 
@@ -161,9 +165,8 @@ def validate(c: dict, role: str):
     if role not in ("a", "b") or not isinstance(c, dict):
         raise ValueError("invalid role/config")
     if role == "a":
-        # One-time configuration schema update, not a protocol fallback:
-        # discard the retired v2rayN control setting and preserve all A
-        # identities, UDP settings and mKCP values.
+        # The existing CF/XHTTP control configuration is independent of the
+        # data transport. Never accept or silently run legacy mKCP settings.
         c.pop("control_socks5", None)
         # The previous A UI incorrectly labelled XHTTP Host/Path as WS.
         # This is a one-time rename of the saved values, not a WS fallback.
@@ -175,9 +178,9 @@ def validate(c: dict, role: str):
             c["control_cf_xhttp_path"] = old_path
         for key, value in A_CF_DEFAULTS.items():
             c.setdefault(key, value)
-        for key, value in A_MKCP_DEFAULTS.items():
-            c.setdefault(key, value)
-    exact_keys(c, COMMON | (A_KEYS | A_MKCP_DEFAULTS.keys() if role == "a" else B_KEYS), role)
+    if any(key.startswith("mkcp_") for key in c):
+        raise ValueError("mKCP data plane is removed; delete mkcp_* keys and add hy2_up_mbps/hy2_down_mbps (see README)")
+    exact_keys(c, COMMON | HY2_KEYS | (A_KEYS if role == "a" else B_KEYS), role)
     if c["role"] != role:
         raise ValueError("config role mismatch")
     for key in ("admin_token", "control_token"):
@@ -193,20 +196,10 @@ def validate(c: dict, role: str):
         if not isinstance(c[key], str) or not c[key].strip():
             raise ValueError(f"{key} required")
     port(c["web_port"], "web_port")
+    for key in HY2_KEYS:
+        if type(c[key]) is not int or not 1 <= c[key] <= 10000:
+            raise ValueError(f"{key} must be integer Mbps 1..10000")
     if role == "a":
-        kcp_ranges = {
-            "mkcp_mtu": (576, 1460),
-            "mkcp_tti": (10, 1000),
-            "mkcp_uplink_capacity": (1, 1000),
-            "mkcp_downlink_capacity": (1, 1000),
-            "mkcp_read_buffer_size": (1, 256),
-            "mkcp_write_buffer_size": (1, 256),
-        }
-        for key, (minimum, maximum) in kcp_ranges.items():
-            if type(c[key]) is not int or not minimum <= c[key] <= maximum:
-                raise ValueError(f"{key} must be integer {minimum}..{maximum}")
-        if type(c["mkcp_congestion"]) is not bool:
-            raise ValueError("mkcp_congestion must be boolean")
         for key in ("udp_port", "xray_udp_port", "socks_port", "control_port",
                     "control_proxy_port", "control_cf_port"):
             port(c[key], key)
@@ -259,6 +252,30 @@ def validate(c: dict, role: str):
         if c["control_port"] == c["web_port"]:
             raise ValueError("control and web ports must be distinct")
         socks_uri(c["warp_socks5"], "warp_socks5")
+
+
+def migrate_to_hysteria2(path: Path, role: str) -> bool:
+    """Explicit, one-way schema migration: never run legacy KCP as fallback."""
+    old = load_json(path)
+    new = dict(old)
+    for key in tuple(new):
+        if key.startswith("mkcp_"):
+            del new[key]
+    for key, value in HY2_DEFAULTS.items():
+        new.setdefault(key, value)
+    validate(new, role)
+    if new == old:
+        return False
+    backup = path.with_name(path.name + ".before-hy2.json")
+    # Refuse to overwrite an earlier migration backup.
+    with path.open("rb") as source, backup.open("xb") as target:
+        shutil.copyfileobj(source, target)
+        target.flush()
+        os.fsync(target.fileno())
+    if os.name != "nt":
+        os.chmod(backup, 0o600)
+    save_json(path, new)
+    return True
 
 
 def write_text(path: Path, text: str):

@@ -1,6 +1,6 @@
-"""A-side UDP 39999: same-socket STUN discovery and opaque mKCP forwarding.
+"""A-side UDP 39999: same-socket STUN discovery and opaque QUIC forwarding.
 
-This is NOT a KCP implementation: Xray remains the only KCP/VLESS endpoint.
+This is NOT a QUIC implementation: Xray remains the only Hysteria/VLESS endpoint.
 An independent loopback UDP socket per remote peer prevents reply misrouting.
 """
 
@@ -27,7 +27,7 @@ def bound_udp_socket(address: tuple[str, int]) -> socket.socket:
 
     By default Windows delivers ICMP Port Unreachable from a closed remote
     UDP port to the *next recvfrom* as WSAECONNRESET (10054). That can break
-    the shared external STUN+mKCP socket when the B SOCKS relay is restarted.
+    the shared external STUN+QUIC socket when the B SOCKS relay is restarted.
     Disable this Winsock behaviour without masking ordinary UDP errors.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -121,7 +121,7 @@ class UdpGateway:
     async def start(self):
         self.outside, _ = await self._loop.create_datagram_endpoint(
             lambda: Outside(self), sock=bound_udp_socket(self.bind))
-        LOG.info("A UDP %s → Xray mKCP %s", self.outside.get_extra_info("sockname"), self.xray_address)
+        LOG.info("A UDP %s → Xray Hysteria2 QUIC %s", self.outside.get_extra_info("sockname"), self.xray_address)
         return self
 
     def receive_external(self, data: bytes, sender: tuple):
